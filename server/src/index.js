@@ -38,12 +38,16 @@ const maxOfflineMb = Number(process.env.MAX_OFFLINE_MB || fileEnv.MAX_OFFLINE_MB
 const db = openDb(dbFile);
 const app = createApp({ db, token, offlineDir, maxOfflineBytes: maxOfflineMb * 1024 * 1024 });
 
-app.listen(port, host, () => {
+const server = app.listen(port, host, () => {
   console.log(`Tab Relay server listening on http://${host}:${port}`);
   console.log(`Database: ${dbFile}`);
   console.log(`Offline copies: ${offlineDir} (max ${maxOfflineMb} MB each)`);
   console.log(`Auth token is stored in ${ENV_FILE} (TAB_RELAY_TOKEN)`);
 });
+
+// Longer than browsers' idle-socket reuse window, so a reused keep-alive socket isn't closed mid-upload.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => { db.close(); process.exit(0); });

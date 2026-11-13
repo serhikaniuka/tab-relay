@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Tab Relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sync this Chrome profile's tabs to a Tab Relay server and open/close tabs on request.",
-  "permissions": ["tabs", "storage", "alarms", "identity", "identity.email"],
+  "permissions": ["tabs", "storage", "alarms", "identity", "identity.email", "pageCapture"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js" },
   "options_page": "options.html",

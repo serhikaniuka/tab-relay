@@ -211,9 +211,40 @@ test('snapshots: save, list, restore, delete', async () => {
 
 // ---------- phase 2: move layout, closing markers, archive, offline ----------
 
-const MHTML = 'From: <Saved by Blink>\r\nSubject: Hello\r\nMIME-Version: 1.0\r\n'
-  + 'Content-Type: multipart/related; type="text/html"; boundary="B"\r\n\r\n--B\r\n'
-  + 'Content-Type: text/html\r\nContent-Location: https://example.com/a\r\n\r\n<h1>Hello offline</h1>\r\n--B--\r\n';
+// Shaped like Chrome's pageCapture output: QP-encoded root HTML, a cid: stylesheet and a base64 image.
+const MHTML = [
+  'From: <Saved by Blink>',
+  'Snapshot-Content-Location: https://example.com/a',
+  'Subject: Hello',
+  'MIME-Version: 1.0',
+  'Content-Type: multipart/related;',
+  '\ttype="text/html";',
+  '\tboundary="----B--"',
+  '',
+  '',
+  '------B--',
+  'Content-Type: text/html',
+  'Content-ID: <frame-1@mhtml.blink>',
+  'Content-Transfer-Encoding: quoted-printable',
+  'Content-Location: https://example.com/a',
+  '',
+  '<html><head><meta charset=3D"utf-8"><link rel=3D"stylesheet" href=3D"cid:css-1@mhtml.b=',
+  'link"></head><body><h1>Hello offline =C3=BC</h1><img src=3D"https://example.com/i.png?a=3D1&amp;b=3D2"><a href=3D"/next">next</a></body></html>',
+  '------B--',
+  'Content-Type: text/css',
+  'Content-Transfer-Encoding: quoted-printable',
+  'Content-Location: cid:css-1@mhtml.blink',
+  '',
+  'h1 { background: url("https://example.com/i.png?a=3D1&b=3D2"); }',
+  '------B--',
+  'Content-Type: image/png',
+  'Content-Transfer-Encoding: base64',
+  'Content-Location: https://example.com/i.png?a=1&b=2',
+  '',
+  Buffer.from('PNGDATA').toString('base64'),
+  '------B----',
+  '',
+].join('\r\n');
 
 async function upload(clientId, query, body = MHTML, headers = {}) {
   const res = await fetch(`${base}/api/clients/${clientId}/offline?${new URLSearchParams(query)}`, {
@@ -334,17 +365,42 @@ test('archive restore: grouped by source window, removed from archive after a su
   assert.equal((await api('POST', '/api/archive/restore', { ids, targetClientId: 'nope' })).status, 404);
 });
 
-test('offline view/download: token via header or query param only on those routes', async () => {
+test('offline view/raw/download: token via header or query param only on those routes', async () => {
   const { id } = (await api('GET', '/api/offline')).body.items[0];
 
   let res = await fetch(`${base}/api/offline/${id}/view`);
   assert.equal(res.status, 401);
   res = await fetch(`${base}/api/offline/${id}/view?token=wrong`);
   assert.equal(res.status, 401);
-  res = await fetch(`${base}/api/offline/${id}/view?token=${TOKEN}`);
+
+  // Raw archive as multipart/related.
+  res = await fetch(`${base}/api/offline/${id}/raw?token=${TOKEN}`);
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type'), /^multipart\/related/);
   assert.equal(await res.text(), MHTML);
+
+  // Rendered view: unpacked HTML, sandboxed, references rewritten to parts of the same copy.
+  res = await fetch(`${base}/api/offline/${id}/view?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^text\/html/);
+  assert.match(res.headers.get('content-security-policy'), /sandbox/);
+  assert.match(res.headers.get('content-security-policy'), /script-src 'none'/);
+  const html = await res.text();
+  assert.match(html, /<h1>Hello offline ü<\/h1>/);
+  assert.match(html, /<base href="https:\/\/example.com\/a">/);
+  const res1 = `${base}/api/offline/${id}/res/1?token=${TOKEN}`;
+  const res2 = `${base}/api/offline/${id}/res/2?token=${TOKEN}`;
+  assert.ok(html.includes(`href="${res1}"`), 'stylesheet cid: rewritten');
+  assert.ok(html.includes(`src="${res2}"`), 'image URL (&amp;-escaped in HTML) rewritten');
+  assert.ok(html.includes('href="/next"'), 'ordinary links untouched');
+
+  res = await fetch(res1);
+  assert.match(res.headers.get('content-type'), /^text\/css/);
+  assert.equal(await res.text(), `h1 { background: url("${res2}"); }`);
+  res = await fetch(res2);
+  assert.equal(res.headers.get('content-type'), 'image/png');
+  assert.equal(await res.text(), 'PNGDATA');
+  assert.equal((await fetch(`${base}/api/offline/${id}/res/99?token=${TOKEN}`)).status, 404);
 
   res = await fetch(`${base}/api/offline/${id}/download?token=${TOKEN}`);
   assert.equal(res.status, 200);
@@ -354,6 +410,14 @@ test('offline view/download: token via header or query param only on those route
   assert.equal((await fetch(`${base}/api/tree?token=${TOKEN}`)).status, 401);
   assert.equal((await fetch(`${base}/api/offline?token=${TOKEN}`)).status, 401);
   assert.equal((await fetch(`${base}/api/offline/9999/view?token=${TOKEN}`)).status, 404);
+});
+
+test('offline view falls back to the raw file when it is not a parseable archive', async () => {
+  const up = await upload('mac-1', { tabId: 101 }, 'just some bytes');
+  const res = await fetch(`${base}/api/offline/${up.body.id}/view?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^multipart\/related/);
+  assert.equal((await api('DELETE', `/api/offline/${up.body.id}`)).status, 200);
 });
 
 test('save offline action, size limit, and deleting copies', async () => {

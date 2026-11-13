@@ -2,7 +2,8 @@
 /*
  * Tab Relay MV3 service worker.
  *  - pushes the full tab state on tab/window events (debounced) and every PUSH_MS
- *  - polls the command queue every POLL_MS, executes open/close commands and acks them
+ *  - polls the command queue every POLL_MS, executes open/close/capture commands and acks them
+ *    (capture = chrome.pageCapture.saveAsMHTML, uploaded to the server as an offline copy)
  * A chrome.alarms tick (every 30 s) restarts the loop if Chrome has suspended the worker.
  */
 
@@ -10,6 +11,7 @@ const POLL_MS = 3000;
 const PUSH_MS = 10000;
 const DEBOUNCE_MS = 1000;
 const FETCH_TIMEOUT_MS = 8000;
+const UPLOAD_TIMEOUT_MS = 300000;
 const ALARM = 'tab-relay-tick';
 
 // ---------- config / identity ----------
@@ -155,11 +157,9 @@ async function targetWindow(newWindow) {
   return null;
 }
 
-async function execOpen(payload) {
-  const items = payload.tabs || [];
-  const errors = [];
+async function openGroup(items, newWindow, errors) {
   let opened = 0;
-  let win = await targetWindow(payload.newWindow);
+  let win = await targetWindow(newWindow);
   for (const it of items) {
     try {
       if (!win) {
@@ -174,8 +174,102 @@ async function execOpen(payload) {
       errors.push({ url: it.url, error: e.message });
     }
   }
-  if (win && payload.newWindow === false) chrome.windows.update(win.windowId, { focused: true }).catch(() => {});
+  if (win && !newWindow) chrome.windows.update(win.windowId, { focused: true }).catch(() => {});
+  return opened;
+}
+
+// payload: {tabs:[{url,pinned}], newWindow, windows?: [[{url,pinned}], ...]}
+// `windows` (only with newWindow) keeps the source window layout: one new window per group.
+async function execOpen(payload) {
+  const errors = [];
+  const groups = payload.newWindow && Array.isArray(payload.windows) && payload.windows.length
+    ? payload.windows : [payload.tabs || []];
+  let opened = 0;
+  for (const g of groups) opened += await openGroup(g, !!payload.newWindow, errors);
   return { ok: errors.length === 0, result: { opened, errors } };
+}
+
+// Keep the service worker alive during long operations (uploads); extension API calls reset its idle timer.
+async function withKeepAlive(fn) {
+  const t = setInterval(() => chrome.runtime.getPlatformInfo(), 20000);
+  try { return await fn(); } finally { clearInterval(t); }
+}
+
+// Discarded / not-yet-loaded tabs can't be captured: reload and wait for them to finish loading.
+async function ensureLoaded(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.discarded && tab.status !== 'unloaded') return tab;
+  await new Promise((resolve) => {
+    const timer = setTimeout(done, 30000);
+    function done() {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }
+    function listener(id, info) { if (id === tabId && info.status === 'complete') done(); }
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId).catch(done);
+  });
+  return chrome.tabs.get(tabId);
+}
+
+function saveAsMHTML(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.pageCapture.saveAsMHTML({ tabId }, (blob) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else if (!blob) reject(new Error('capture returned nothing'));
+      else resolve(blob);
+    });
+  });
+}
+
+async function uploadCapture(cfg, clientId, cmdId, tab, blob) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS);
+  try {
+    const q = new URLSearchParams({ tabId: tab.id, commandId: cmdId });
+    const res = await fetch(`${cfg.serverUrl}/api/clients/${encodeURIComponent(clientId)}/offline?${q}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${cfg.token}`,
+        'content-type': 'multipart/related',
+        'x-tab-url': encodeURIComponent((tab.url || '').slice(0, 4000)),
+        'x-tab-title': encodeURIComponent((tab.title || '').slice(0, 500)),
+      },
+      body: blob,
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// payload: {tabIds:[...], archiveMap?}. Captures each tab as MHTML and uploads it.
+async function execCapture(cmd, cfg, clientId) {
+  const saved = [];
+  const errors = [];
+  await withKeepAlive(async () => {
+    for (const tabId of cmd.payload.tabIds || []) {
+      try {
+        const tab = await ensureLoaded(tabId);
+        const blob = await saveAsMHTML(tabId);
+        let r;
+        for (let attempt = 1; ; attempt++) {   // retry transient network errors
+          try { r = await uploadCapture(cfg, clientId, cmd.id, tab, blob); break; } catch (e) {
+            if (attempt >= 3 || /^HTTP 4/.test(e.message)) throw e;
+            await new Promise((res) => setTimeout(res, attempt * 1500));
+          }
+        }
+        saved.push({ tabId, id: r.id, size: r.size });
+      } catch (e) {
+        errors.push({ tabId, error: e.message });
+      }
+    }
+  });
+  return { ok: errors.length === 0, result: { saved, errors } };
 }
 
 async function execClose(payload) {
@@ -212,6 +306,7 @@ async function pollCommands() {
         try {
           if (cmd.type === 'open') outcome = await execOpen(cmd.payload);
           else if (cmd.type === 'close') outcome = await execClose(cmd.payload);
+          else if (cmd.type === 'capture') outcome = await execCapture(cmd, cfg, clientId);
           else outcome = { ok: false, result: `unknown command type ${cmd.type}` };
         } catch (e) {
           outcome = { ok: false, result: e.message };

@@ -24,25 +24,41 @@
 
 <main id="app" hidden>
   <div id="toolbar">
-    <span id="sel-count" class="muted">0 selected</span>
-    <label>Target
-      <select id="target"></select>
-    </label>
-    <label title="Open the tabs in a new window on the target"><input type="checkbox" id="new-window" checked> new window</label>
-    <button id="btn-open">Open on target</button>
-    <button id="btn-move">Move to target</button>
-    <button id="btn-close" class="danger">Close on source</button>
-    <button id="btn-snapshot">Save snapshot</button>
-    <span class="spacer"></span>
-    <input id="filter" type="search" placeholder="Filter tabs…">
-    <button id="btn-expand" class="link">Expand all</button>
-    <button id="btn-collapse" class="link">Collapse all</button>
+    <div class="bar">
+      <span id="sel-count" class="muted">0 tabs selected</span>
+      <label>Target
+        <select id="target"></select>
+      </label>
+      <label title="Open the tabs in new windows on the target (keeping the source window layout)"><input type="checkbox" id="new-window" checked> new window</label>
+      <button id="btn-open" title="Open copies on the target">Open on target</button>
+      <button id="btn-move" title="Open on the target, then close on the source">Move to target</button>
+      <span class="sep"></span>
+      <button id="btn-archive" title="Close on the source and keep in the Archive">Archive</button>
+      <button id="btn-archive-offline" title="Save offline copies, then archive">Archive + save offline</button>
+      <button id="btn-offline" title="Save offline copies (MHTML) on the server">Save offline</button>
+      <button id="btn-snapshot">Save snapshot</button>
+      <button id="btn-close" class="danger" title="Close and remove without archiving">Delete</button>
+    </div>
+    <div class="bar" id="archive-bar" hidden>
+      <span id="asel-count" class="muted"></span>
+      <button id="btn-restore" title="Open on the target and remove from the archive">Restore to target</button>
+      <button id="btn-purge" class="danger">Delete permanently</button>
+    </div>
+    <div class="bar">
+      <input id="filter" type="search" placeholder="Filter tabs…">
+      <button id="btn-expand" class="link">Expand all</button>
+      <button id="btn-collapse" class="link">Collapse all</button>
+      <button id="btn-clear" class="link">Clear selection</button>
+      <span class="muted small hint">Drag tabs, windows or profiles onto a profile to move them there (hold Ctrl to copy); drag archived tabs to restore.</span>
+    </div>
   </div>
   <div id="msg"></div>
 
   <div id="layout">
     <div id="tree"></div>
     <aside>
+      <h2>Offline copies <span id="offline-total" class="badge"></span></h2>
+      <div id="offline" class="muted">No offline copies yet.</div>
       <h2>Snapshots</h2>
       <div id="snapshots" class="muted">No snapshots yet.</div>
       <h2>Recent commands</h2>

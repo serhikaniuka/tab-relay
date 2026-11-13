@@ -7,12 +7,16 @@ const REFRESH_MS = 4000;
 const state = {
   token: new URLSearchParams(location.hash.slice(1)).get('token') || localStorage.getItem('tabRelayToken') || '',
   tree: null,
+  archive: [],
+  offline: { items: [], totalSize: 0 },
   snapshots: [],
   commands: [],
-  selected: new Set(),                 // "clientId:tabId"
+  // Two independent selections: live tabs ("clientId:tabId") and archive items (id as string).
+  sel: { live: new Set(), archive: new Set() },
   collapsed: new Set(JSON.parse(localStorage.getItem('tabRelayCollapsed') || '[]')),
   openSnaps: new Set(),
   filter: '',
+  dragging: false,
 };
 
 // ---------- helpers ----------
@@ -34,16 +38,29 @@ function ago(ms) {
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
   return `${Math.round(s / 86400)}d ago`;
 }
-function profileName(c) {
-  const who = c.profile.email || 'not signed in';
-  return c.profile.label && c.profile.label !== c.profile.email ? `${who} (${c.profile.label})` : who;
+function bytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
+function day(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function profileText(email, label) {
+  const who = email || 'not signed in';
+  return label && label !== email ? `${who} (${label})` : who;
+}
+function profileName(c) { return profileText(c.profile.email, c.profile.label); }
 function clientName(c) { return `${c.machine} — ${profileName(c)}`; }
+function clientById(id) { return state.tree?.clients.find((c) => c.id === id); }
+function plural(n, w) { return `${n} ${w}${n === 1 ? '' : 's'}`; }
 function flash(text, isError = false) {
   const d = el('div', { class: isError ? 'error' : '' }, text);
   $('#msg').append(d);
   setTimeout(() => d.remove(), isError ? 8000 : 4000);
 }
+const offlineUrl = (id, kind = 'view') => `/api/offline/${id}/${kind}?token=${encodeURIComponent(state.token)}`;
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -85,15 +102,15 @@ $('#logout').addEventListener('click', () => {
 // ---------- data ----------
 let refreshing = false;
 async function refresh() {
-  if (refreshing || !state.token) return;
+  if (refreshing || !state.token || state.dragging) return;
   refreshing = true;
   try {
-    const [tree, snaps, cmds] = await Promise.all([
-      api('GET', '/api/tree'), api('GET', '/api/snapshots'), api('GET', '/api/commands?limit=15'),
+    const [tree, archive, offline, snaps, cmds] = await Promise.all([
+      api('GET', '/api/tree'), api('GET', '/api/archive'), api('GET', '/api/offline'),
+      api('GET', '/api/snapshots'), api('GET', '/api/commands?limit=15'),
     ]);
-    state.tree = tree;
-    state.snapshots = snaps.snapshots;
-    state.commands = cmds.commands;
+    if (state.dragging) return;   // don't rebuild the DOM under an active drag
+    Object.assign(state, { tree, archive: archive.items, offline, snapshots: snaps.snapshots, commands: cmds.commands });
     $('#login').hidden = true;
     $('#app').hidden = false;
     pruneSelection();
@@ -106,17 +123,15 @@ async function refresh() {
   }
 }
 
-function allTabs() {
-  const out = [];
-  for (const c of state.tree?.clients || []) for (const w of c.windows) for (const t of w.tabs) out.push({ c, w, t });
-  return out;
-}
 function pruneSelection() {
-  const live = new Set(allTabs().map(({ c, t }) => `${c.id}:${t.id}`));
-  for (const k of state.selected) if (!live.has(k)) state.selected.delete(k);
+  const live = new Set();
+  for (const c of state.tree?.clients || []) for (const w of c.windows) for (const t of w.tabs) live.add(`${c.id}:${t.id}`);
+  for (const k of state.sel.live) if (!live.has(k)) state.sel.live.delete(k);
+  const arch = new Set(state.archive.map((a) => String(a.id)));
+  for (const k of state.sel.archive) if (!arch.has(k)) state.sel.archive.delete(k);
 }
-function selectedRefs() {
-  return [...state.selected].map((k) => {
+function refsFromKeys(keys) {
+  return keys.map((k) => {
     const i = k.lastIndexOf(':');
     return { clientId: k.slice(0, i), tabId: Number(k.slice(i + 1)) };
   });
@@ -124,25 +139,145 @@ function selectedRefs() {
 function matchesFilter(t) {
   if (!state.filter) return true;
   const f = state.filter.toLowerCase();
-  return t.title.toLowerCase().includes(f) || t.url.toLowerCase().includes(f);
+  return (t.title || '').toLowerCase().includes(f) || (t.url || '').toLowerCase().includes(f);
+}
+function offlineByUrl() {
+  const m = new Map();
+  for (const o of state.offline.items) if (!m.has(o.url)) m.set(o.url, o);   // newest first
+  return m;
+}
+
+// ---------- actions (shared by toolbar, per-node buttons and drag & drop) ----------
+const target = () => $('#target').value;
+const targetLabel = (id = target()) => { const c = clientById(id); return c ? clientName(c) : '?'; };
+const newWindow = () => $('#new-window').checked;
+
+async function run(fn, okText, clear) {
+  try {
+    await fn();
+    flash(okText);
+    if (clear) clear.clear();
+    await refresh();
+  } catch (e) { flash(e.message, true); }
+}
+
+const act = {
+  open(keys, to = target()) {
+    if (!to) return flash('Choose a target first', true);
+    return run(() => api('POST', '/api/actions/open', { tabs: refsFromKeys(keys), targetClientId: to, newWindow: newWindow() }),
+      `Opening ${plural(keys.length, 'tab')} on ${targetLabel(to)}`, state.sel.live);
+  },
+  move(keys, to = target()) {
+    if (!to) return flash('Choose a target first', true);
+    return run(() => api('POST', '/api/actions/move', { tabs: refsFromKeys(keys), targetClientId: to, newWindow: newWindow() }),
+      `Moving ${plural(keys.length, 'tab')} to ${targetLabel(to)} (sources close once they are open)`, state.sel.live);
+  },
+  archive(keys, offline = false) {
+    return run(() => api('POST', '/api/actions/archive', { tabs: refsFromKeys(keys), offline }),
+      `Archiving ${plural(keys.length, 'tab')}${offline ? ' (saving offline copies first)' : ''}`, state.sel.live);
+  },
+  offline(keys) {
+    return run(() => api('POST', '/api/actions/offline', { tabs: refsFromKeys(keys) }),
+      `Saving ${plural(keys.length, 'tab')} for offline reading`, state.sel.live);
+  },
+  del(keys) {
+    if (!confirm(`Close and remove ${plural(keys.length, 'tab')}? They will NOT be archived.`)) return;
+    return run(() => api('POST', '/api/actions/close', { tabs: refsFromKeys(keys) }),
+      `Closing ${plural(keys.length, 'tab')}`, state.sel.live);
+  },
+  snapshot(keys) {
+    const name = prompt('Snapshot name:', `Snapshot ${new Date().toLocaleString()}`);
+    if (name === null) return;
+    return run(() => api('POST', '/api/snapshots', { tabs: refsFromKeys(keys), name }),
+      `Saved snapshot "${name}" (${plural(keys.length, 'tab')})`, state.sel.live);
+  },
+  restore(ids, to = target()) {
+    if (!to) return flash('Choose a target first', true);
+    return run(() => api('POST', '/api/archive/restore', { ids: ids.map(Number), targetClientId: to, newWindow: true }),
+      `Restoring ${plural(ids.length, 'archived tab')} on ${targetLabel(to)}`, state.sel.archive);
+  },
+  purge(ids) {
+    if (!confirm(`Permanently delete ${plural(ids.length, 'archived tab')} (and their offline copies)?`)) return;
+    return run(() => api('POST', '/api/archive/delete', { ids: ids.map(Number) }),
+      `Deleted ${plural(ids.length, 'archived tab')}`, state.sel.archive);
+  },
+};
+
+// Hover buttons for a live node / archive node.
+function liveActions(keys) {
+  if (!keys.length) return [];
+  return [
+    el('button', { class: 'mini', title: 'Move to the target client', onclick: () => act.move(keys) }, 'Move'),
+    el('button', { class: 'mini', title: 'Archive (close on source, keep on server)', onclick: () => act.archive(keys) }, 'Archive'),
+    el('button', { class: 'mini', title: 'Archive and save offline copies', onclick: () => act.archive(keys, true) }, 'Archive+offline'),
+    el('button', { class: 'mini', title: 'Save offline copies (MHTML)', onclick: () => act.offline(keys) }, 'Offline'),
+    el('button', { class: 'mini danger', title: 'Close and remove (no archive)', onclick: () => act.del(keys) }, 'Delete'),
+  ];
+}
+function archiveActions(ids) {
+  return [
+    el('button', { class: 'mini', title: 'Restore on the target client', onclick: () => act.restore(ids) }, 'Restore'),
+    el('button', { class: 'mini danger', title: 'Delete permanently', onclick: () => act.purge(ids) }, 'Delete'),
+  ];
+}
+
+// ---------- drag & drop ----------
+// Dragging a node carries its tabs; dragging a selected tab carries the whole selection.
+function makeDraggable(row, kind, keysFn) {
+  row.draggable = true;
+  row.addEventListener('dragstart', (e) => {
+    const keys = keysFn();
+    if (!keys.length) return e.preventDefault();
+    state.dragging = true;
+    e.dataTransfer.setData('application/x-tab-relay', JSON.stringify({ kind, keys }));
+    e.dataTransfer.effectAllowed = 'copyMove';
+    document.body.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => {
+    state.dragging = false;
+    document.body.classList.remove('dragging');
+  });
+}
+function makeDropTarget(row, clientId) {
+  row.classList.add('drop-target');
+  row.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer.types.includes('application/x-tab-relay')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = e.ctrlKey || e.altKey ? 'copy' : 'move';
+    row.classList.add('drop-over');
+  });
+  row.addEventListener('dragleave', () => row.classList.remove('drop-over'));
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    row.classList.remove('drop-over');
+    state.dragging = false;
+    document.body.classList.remove('dragging');
+    let data;
+    try { data = JSON.parse(e.dataTransfer.getData('application/x-tab-relay')); } catch (err) { return; }
+    if (data.kind === 'archive') act.restore(data.keys, clientId);
+    else if (e.ctrlKey || e.altKey) act.open(data.keys, clientId);
+    else act.move(data.keys, clientId);
+  });
 }
 
 // ---------- rendering ----------
 function render() {
-  renderTree();
   renderTargets();
+  renderTree();
   renderSnapshots();
+  renderOffline();
   renderCommands();
   updateSelectionUi();
 }
 
-// A group node; `keys` are the tab-selection keys underneath it.
-function groupNode(key, cls, rowContent, children, keys) {
+// A group node; `keys` are the selection keys (in selection set `set`) underneath it.
+function groupNode({ key, cls, content, children, keys, set, actions = [], drag, dropClient }) {
   const node = el('div', { class: `node ${cls}${state.collapsed.has(key) ? ' collapsed' : ''}` });
   const cb = el('input', { type: 'checkbox' });
   cb.dataset.keys = JSON.stringify(keys);
+  cb.dataset.set = set;
   cb.addEventListener('change', () => {
-    for (const k of keys) cb.checked ? state.selected.add(k) : state.selected.delete(k);
+    for (const k of keys) cb.checked ? state.sel[set].add(k) : state.sel[set].delete(k);
     updateSelectionUi();
   });
   const toggle = () => {
@@ -150,24 +285,62 @@ function groupNode(key, cls, rowContent, children, keys) {
     node.classList.contains('collapsed') ? state.collapsed.add(key) : state.collapsed.delete(key);
     localStorage.setItem('tabRelayCollapsed', JSON.stringify([...state.collapsed]));
   };
-  const row = el('div', { class: 'row' }, el('span', { class: 'twisty', onclick: toggle }), cb);
-  for (const part of rowContent) row.append(part);
+  const row = el('div', { class: 'row' }, el('span', { class: 'twisty', onclick: toggle }), cb, content,
+    actions.length ? el('span', { class: 'actions' }, actions) : null);
   row.querySelector('.label')?.addEventListener('click', toggle);
+  if (drag && keys.length) makeDraggable(row, set, () => keys);
+  if (dropClient) makeDropTarget(row, dropClient);
   node.append(row, el('div', { class: 'children' }, children));
   node.dataset.key = key;
   return node;
 }
 
+function leafNode({ key, set, cls, content, actions, title }) {
+  const cb = el('input', { type: 'checkbox', 'data-leaf': key, 'data-set': set });
+  cb.checked = state.sel[set].has(key);
+  cb.addEventListener('change', () => {
+    cb.checked ? state.sel[set].add(key) : state.sel[set].delete(key);
+    updateSelectionUi();
+  });
+  const row = el('div', { class: 'row', title }, el('span', { class: 'twisty' }), cb, content,
+    el('span', { class: 'actions' }, actions));
+  row.querySelector('.label')?.addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
+  makeDraggable(row, set, () => (state.sel[set].has(key) ? [...state.sel[set]] : [key]));
+  return el('div', { class: `node leaf ${cls}` }, row);
+}
+
+function favicon(url) {
+  return url && /^(https?:|data:image\/)/.test(url)
+    ? el('img', { class: 'fav', src: url, loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => { e.target.replaceWith(el('span', { class: 'fav blank' })); } })
+    : el('span', { class: 'fav blank' });
+}
+function urlSpan(url) {
+  const safe = /^(https?|ftp|file):/i.test(url) ? url : null;
+  return el('span', { class: 'url' }, safe ? el('a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, url) : url);
+}
+function offlineBadge(o) {
+  return el('a', { class: 'badge offline', href: offlineUrl(o.id), target: '_blank', rel: 'noopener',
+    title: `Open the saved copy (${bytes(o.size)})` }, `offline ${bytes(o.size)}`);
+}
+
+const CLOSING_TEXT = { move: 'moving…', archive: 'archiving…', delete: 'closing…', close: 'closing…' };
+
 function renderTree() {
   const root = $('#tree');
   root.textContent = '';
+  root.append(renderLive(), renderArchive());
+}
+
+function renderLive() {
+  const frag = document.createDocumentFragment();
   const clients = state.tree?.clients || [];
   if (!clients.length) {
-    root.append(el('div', { class: 'empty muted' },
+    frag.append(el('div', { class: 'empty muted' },
       'No clients yet. Install the extension in Chrome, set the server URL and token in its options, and it will appear here.'));
-    return;
+    return frag;
   }
   const now = state.tree.now;
+  const offMap = offlineByUrl();
   const machines = new Map();
   for (const c of clients) {
     if (!machines.has(c.machine)) machines.set(c.machine, []);
@@ -182,79 +355,173 @@ function renderTree() {
         const tabs = w.tabs.filter(matchesFilter);
         const wKeys = tabs.map((t) => `${c.id}:${t.id}`);
         pKeys.push(...wKeys);
-        const tabNodes = tabs.map((t) => tabNode(c, t));
-        const n = groupNode(`w:${c.id}:${w.id}`, 'window', [
-          el('span', { class: 'label' }, `Window ${wi + 1}`),
-          el('span', { class: 'badge' }, `${tabs.length} tab${tabs.length === 1 ? '' : 's'}`),
-          w.focused ? el('span', { class: 'badge' }, 'focused') : null,
-          w.incognito ? el('span', { class: 'badge' }, 'incognito') : null,
-        ].filter(Boolean), tabNodes, wKeys);
+        const n = groupNode({
+          key: `w:${c.id}:${w.id}`, cls: 'window', set: 'live', keys: wKeys, drag: true,
+          content: [
+            el('span', { class: 'label' }, `Window ${wi + 1}`),
+            el('span', { class: 'badge' }, plural(tabs.length, 'tab')),
+            w.focused ? el('span', { class: 'badge' }, 'focused') : null,
+            w.incognito ? el('span', { class: 'badge' }, 'incognito') : null,
+          ],
+          children: tabs.map((t) => liveTab(c, t, offMap.get(t.url))),
+          actions: liveActions(wKeys),
+        });
         if (!tabs.length && state.filter) n.classList.add('hidden-by-filter');
         return n;
       });
       mKeys.push(...pKeys);
       const tabCount = c.windows.reduce((n, w) => n + w.tabs.length, 0);
-      return groupNode(`p:${c.id}`, 'profile', [
-        el('span', { class: `dot${c.online ? ' on' : ''}`, title: c.online ? 'online' : 'offline' }),
-        el('span', { class: 'label', title: `client id ${c.id}` }, profileName(c)),
-        el('span', { class: 'badge' }, `${c.windows.length} win · ${tabCount} tabs`),
-        el('span', { class: 'muted', style: 'font-size:12px' }, c.online ? 'online' : `offline · seen ${ago(now - c.lastSeen)}`),
-        c.online ? null : el('button', {
-          class: 'link', title: 'Remove this client from the server',
-          onclick: async () => {
-            if (!confirm(`Forget ${clientName(c)}? It will re-appear if the extension connects again.`)) return;
-            await api('DELETE', `/api/clients/${encodeURIComponent(c.id)}`).catch((e) => flash(e.message, true));
-            refresh();
-          },
-        }, 'forget'),
-      ].filter(Boolean), winNodes, pKeys);
+      return groupNode({
+        key: `p:${c.id}`, cls: 'profile', set: 'live', keys: pKeys, drag: true, dropClient: c.id,
+        content: [
+          el('span', { class: `dot${c.online ? ' on' : ''}`, title: c.online ? 'online' : 'offline' }),
+          el('span', { class: 'label', title: `client id ${c.id}\nDrop tabs here to move them to this profile (hold Ctrl to copy)` }, profileName(c)),
+          el('span', { class: 'badge' }, `${c.windows.length} win · ${tabCount} tabs`),
+          el('span', { class: 'muted small' }, c.online ? 'online' : `offline · seen ${ago(now - c.lastSeen)}`),
+          c.online ? null : el('button', {
+            class: 'link', title: 'Remove this client from the server',
+            onclick: async () => {
+              if (!confirm(`Forget ${clientName(c)}? It will re-appear if the extension connects again.`)) return;
+              await api('DELETE', `/api/clients/${encodeURIComponent(c.id)}`).catch((e) => flash(e.message, true));
+              refresh();
+            },
+          }, 'forget'),
+        ],
+        children: winNodes,
+        actions: liveActions(pKeys),
+      });
     });
     const anyOnline = mclients.some((c) => c.online);
-    root.append(groupNode(`m:${machine}`, 'machine', [
-      el('span', { class: `dot${anyOnline ? ' on' : ''}` }),
-      el('span', { class: 'label' }, machine),
-      el('span', { class: 'badge' }, `${mclients.length} profile${mclients.length === 1 ? '' : 's'}`),
-    ], profileNodes, mKeys));
+    frag.append(groupNode({
+      key: `m:${machine}`, cls: 'machine', set: 'live', keys: mKeys, drag: true,
+      // A machine with a single profile is also a drop target for that profile.
+      dropClient: mclients.length === 1 ? mclients[0].id : null,
+      content: [
+        el('span', { class: `dot${anyOnline ? ' on' : ''}` }),
+        el('span', { class: 'label' }, machine),
+        el('span', { class: 'badge' }, plural(mclients.length, 'profile')),
+      ],
+      children: profileNodes,
+      actions: liveActions(mKeys),
+    }));
   }
+  return frag;
 }
 
-function tabNode(c, t) {
+function liveTab(c, t, off) {
   const key = `${c.id}:${t.id}`;
-  const cb = el('input', { type: 'checkbox', 'data-tab': key });
-  cb.checked = state.selected.has(key);
-  cb.addEventListener('change', () => {
-    cb.checked ? state.selected.add(key) : state.selected.delete(key);
-    updateSelectionUi();
-  });
-  const fav = t.favIconUrl && /^(https?:|data:image\/)/.test(t.favIconUrl)
-    ? el('img', { class: 'fav', src: t.favIconUrl, loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => { e.target.replaceWith(el('span', { class: 'fav blank' })); } })
-    : el('span', { class: 'fav blank' });
-  const safeHref = /^(https?|ftp|file):/i.test(t.url) ? t.url : null;
-  return el('div', { class: `node leaf tab${t.active ? ' active' : ''}` },
-    el('div', { class: 'row', title: `${t.title}\n${t.url}\nfrom ${clientName(c)}` },
-      el('span', { class: 'twisty' }), cb, fav,
-      el('span', { class: 'label title', onclick: () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); } }, t.title || t.url || '(untitled)'),
+  return leafNode({
+    key, set: 'live', cls: `tab${t.active ? ' active' : ''}${t.closing ? ' closing' : ''}`,
+    title: `${t.title}\n${t.url}\nfrom ${clientName(c)}`,
+    content: [
+      favicon(t.favIconUrl),
+      el('span', { class: 'label title' }, t.title || t.url || '(untitled)'),
       t.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
-      el('span', { class: 'url' }, safeHref ? el('a', { href: safeHref, target: '_blank', rel: 'noopener noreferrer' }, t.url) : t.url)));
+      t.closing ? el('span', { class: 'badge warn' }, CLOSING_TEXT[t.closing] || 'closing…') : null,
+      off ? offlineBadge(off) : null,
+      urlSpan(t.url),
+    ],
+    actions: liveActions([key]),
+  });
+}
+
+// Archive: machine -> profile -> date -> items
+function renderArchive() {
+  const items = state.archive.filter(matchesFilter);
+  const tree = new Map();
+  for (const a of items) {
+    const m = a.source.machine || '?';
+    const p = `${a.source.email}\u0000${a.source.label}`;
+    const d = day(a.archivedAt);
+    if (!tree.has(m)) tree.set(m, new Map());
+    const pm = tree.get(m);
+    if (!pm.has(p)) pm.set(p, new Map());
+    const dm = pm.get(p);
+    if (!dm.has(d)) dm.set(d, []);
+    dm.get(d).push(a);
+  }
+  const allKeys = items.map((a) => String(a.id));
+  const machineNodes = [...tree].map(([machine, pm]) => {
+    const mKeys = [];
+    const pNodes = [...pm].map(([p, dm]) => {
+      const [email, label] = p.split('\u0000');
+      const pKeys = [];
+      const dNodes = [...dm].map(([d, list]) => {
+        const dKeys = list.map((a) => String(a.id));
+        pKeys.push(...dKeys);
+        return groupNode({
+          key: `ad:${machine}:${p}:${d}`, cls: 'date', set: 'archive', keys: dKeys, drag: true,
+          content: [el('span', { class: 'label' }, d), el('span', { class: 'badge' }, plural(list.length, 'tab'))],
+          children: list.map(archiveTab),
+          actions: archiveActions(dKeys),
+        });
+      });
+      mKeys.push(...pKeys);
+      return groupNode({
+        key: `ap:${machine}:${p}`, cls: 'profile', set: 'archive', keys: pKeys, drag: true,
+        content: [el('span', { class: 'label' }, profileText(email, label)), el('span', { class: 'badge' }, plural(pKeys.length, 'tab'))],
+        children: dNodes,
+        actions: archiveActions(pKeys),
+      });
+    });
+    return groupNode({
+      key: `am:${machine}`, cls: 'machine', set: 'archive', keys: mKeys, drag: true,
+      content: [el('span', { class: 'label' }, machine), el('span', { class: 'badge' }, plural(mKeys.length, 'tab'))],
+      children: pNodes,
+      actions: archiveActions(mKeys),
+    });
+  });
+  return groupNode({
+    key: 'archive', cls: 'archive-root', set: 'archive', keys: allKeys,
+    content: [
+      el('span', { class: 'label' }, 'Archive'),
+      el('span', { class: 'badge' }, plural(state.archive.length, 'tab')),
+      state.archive.length ? null : el('span', { class: 'muted small' }, 'archived tabs appear here'),
+    ],
+    children: machineNodes,
+    actions: allKeys.length ? archiveActions(allKeys) : [],
+  });
+}
+
+function archiveTab(a) {
+  const key = String(a.id);
+  return leafNode({
+    key, set: 'archive', cls: 'tab archived',
+    title: `${a.title}\n${a.url}\nfrom ${a.source.machine} — ${profileText(a.source.email, a.source.label)}\narchived ${new Date(a.archivedAt).toLocaleString()}`,
+    content: [
+      favicon(a.favIconUrl),
+      el('span', { class: 'label title' }, a.title || a.url || '(untitled)'),
+      a.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
+      a.offline ? offlineBadge(a.offline) : null,
+      a.offline ? el('a', { class: 'badge', href: offlineUrl(a.offline.id, 'download'), title: 'Download .mhtml' }, '⬇') : null,
+      el('span', { class: 'muted small' }, new Date(a.archivedAt).toLocaleTimeString()),
+      urlSpan(a.url),
+    ],
+    actions: archiveActions([key]),
+  });
 }
 
 function updateSelectionUi() {
-  // Sync group checkboxes (checked / indeterminate) with the selection.
+  // Sync group checkboxes (checked / indeterminate) with their selection set.
   for (const cb of document.querySelectorAll('#tree input[data-keys]')) {
     const keys = JSON.parse(cb.dataset.keys);
-    const n = keys.filter((k) => state.selected.has(k)).length;
+    const set = state.sel[cb.dataset.set];
+    const n = keys.filter((k) => set.has(k)).length;
     cb.checked = keys.length > 0 && n === keys.length;
     cb.indeterminate = n > 0 && n < keys.length;
     cb.disabled = keys.length === 0;
   }
-  for (const cb of document.querySelectorAll('#tree input[data-tab]')) cb.checked = state.selected.has(cb.dataset.tab);
-  const n = state.selected.size;
-  $('#sel-count').textContent = `${n} selected`;
-  const hasTarget = !!$('#target').value;
-  $('#btn-open').disabled = !n || !hasTarget;
-  $('#btn-move').disabled = !n || !hasTarget;
-  $('#btn-close').disabled = !n;
-  $('#btn-snapshot').disabled = !n;
+  for (const cb of document.querySelectorAll('#tree input[data-leaf]')) cb.checked = state.sel[cb.dataset.set].has(cb.dataset.leaf);
+  const n = state.sel.live.size;
+  const a = state.sel.archive.size;
+  const hasTarget = !!target();
+  $('#sel-count').textContent = `${plural(n, 'tab')} selected`;
+  for (const id of ['#btn-open', '#btn-move']) $(id).disabled = !n || !hasTarget;
+  for (const id of ['#btn-archive', '#btn-archive-offline', '#btn-offline', '#btn-close', '#btn-snapshot']) $(id).disabled = !n;
+  $('#archive-bar').hidden = !a;
+  $('#asel-count').textContent = `${plural(a, 'archived tab')} selected`;
+  $('#btn-restore').disabled = !a || !hasTarget;
+  $('#btn-purge').disabled = !a;
 }
 
 function targetOptions(select) {
@@ -266,7 +533,7 @@ function targetOptions(select) {
   if ([...select.options].some((o) => o.value === prev)) select.value = prev;
 }
 function renderTargets() { targetOptions($('#target')); }
-$('#target').addEventListener('change', () => { localStorage.setItem('tabRelayTarget', $('#target').value); updateSelectionUi(); });
+$('#target').addEventListener('change', () => { localStorage.setItem('tabRelayTarget', target()); updateSelectionUi(); });
 
 function renderSnapshots() {
   const box = $('#snapshots');
@@ -275,32 +542,50 @@ function renderSnapshots() {
   for (const s of state.snapshots) {
     const sel = el('select', { title: 'Restore target' });
     targetOptions(sel);
-    const open = state.openSnaps.has(s.id);
-    const list = el('ul', { hidden: !open }, s.tabs.map((t) =>
+    const list = el('ul', { hidden: !state.openSnaps.has(s.id) }, s.tabs.map((t) =>
       el('li', { title: `${t.url}\nfrom ${t.source?.machine} — ${t.source?.email || 'not signed in'}` }, t.title || t.url)));
-    box.append(el('div', { class: 'snap' },
+    box.append(el('div', { class: 'item' },
       el('div', { class: 'head' },
         el('span', { class: 'name', title: 'Show tabs', onclick: () => {
           list.hidden = !list.hidden;
           list.hidden ? state.openSnaps.delete(s.id) : state.openSnaps.add(s.id);
-        } }, `${s.name}`),
+        } }, s.name),
         el('span', { class: 'badge' }, `${s.tabs.length}`),
         el('button', { class: 'link danger', title: 'Delete snapshot', onclick: async () => {
           if (!confirm(`Delete snapshot "${s.name}"?`)) return;
           await api('DELETE', `/api/snapshots/${s.id}`).catch((e) => flash(e.message, true));
           refresh();
         } }, '✕')),
-      el('div', { class: 'muted', style: 'font-size:12px' }, new Date(s.createdAt).toLocaleString()),
+      el('div', { class: 'muted small' }, new Date(s.createdAt).toLocaleString()),
       el('div', { class: 'head', style: 'margin-top:4px' }, sel,
-        el('button', { onclick: async () => {
+        el('button', { onclick: () => {
           if (!sel.value) return;
-          try {
-            await api('POST', `/api/snapshots/${s.id}/restore`, { targetClientId: sel.value, newWindow: true });
-            flash(`Restoring "${s.name}" (${s.tabs.length} tabs) on ${sel.options[sel.selectedIndex].text.slice(2)}`);
-            refresh();
-          } catch (e) { flash(e.message, true); }
+          run(() => api('POST', `/api/snapshots/${s.id}/restore`, { targetClientId: sel.value, newWindow: true }),
+            `Restoring "${s.name}" (${plural(s.tabs.length, 'tab')}) on ${targetLabel(sel.value)}`);
         } }, 'Restore')),
       list));
+  }
+}
+
+function renderOffline() {
+  const box = $('#offline');
+  const { items, totalSize } = state.offline;
+  $('#offline-total').textContent = items.length ? `${items.length} · ${bytes(totalSize)}` : '';
+  box.textContent = '';
+  if (!items.length) { box.textContent = 'No offline copies yet.'; return; }
+  for (const o of items.filter(matchesFilter)) {
+    box.append(el('div', { class: 'item', title: `${o.url}\nfrom ${o.source.machine} — ${profileText(o.source.email, o.source.label)}` },
+      el('div', { class: 'head' },
+        favicon(o.favIconUrl),
+        el('a', { class: 'name', href: offlineUrl(o.id), target: '_blank', rel: 'noopener' }, o.title || o.url),
+        el('a', { class: 'link small', href: offlineUrl(o.id, 'raw'), target: '_blank', rel: 'noopener', title: 'The archive as multipart/related (Chrome saves it; open the file to view)' }, 'mhtml'),
+        el('a', { class: 'link', href: offlineUrl(o.id, 'download'), title: 'Download .mhtml' }, '⬇'),
+        el('button', { class: 'link danger', title: 'Delete this offline copy', onclick: async () => {
+          if (!confirm(`Delete the offline copy of "${o.title || o.url}"?`)) return;
+          await api('DELETE', `/api/offline/${o.id}`).catch((e) => flash(e.message, true));
+          refresh();
+        } }, '✕')),
+      el('div', { class: 'muted small' }, `${bytes(o.size)} · ${o.source.machine} · ${new Date(o.createdAt).toLocaleString()}`)));
   }
 }
 
@@ -310,47 +595,29 @@ function renderCommands() {
   if (!state.commands.length) { box.textContent = 'None yet.'; return; }
   for (const c of state.commands) {
     const n = c.type === 'open' ? c.payload.tabs?.length : c.payload.tabIds?.length;
+    const what = c.type === 'close' && c.payload.reason && c.payload.reason !== 'close' ? `close (${c.payload.reason})` : c.type;
     box.append(el('div', { class: 'cmd', title: c.result ? JSON.stringify(c.result) : '' },
       el('span', { class: `st-${c.status}` }, c.status),
-      el('span', {}, `${c.type} ${n} on ${c.client.machine || '?'} (${c.client.email || 'not signed in'})`),
+      el('span', {}, `${what} ${n} on ${c.client.machine || '?'} (${c.client.email || 'not signed in'})`),
       el('span', { class: 'muted', style: 'margin-left:auto' }, new Date(c.createdAt).toLocaleTimeString())));
   }
 }
 
-// ---------- actions ----------
-function targetText() { const s = $('#target'); return s.options[s.selectedIndex]?.text.slice(2) || ''; }
+// ---------- toolbar ----------
+const liveSel = () => [...state.sel.live];
+const archSel = () => [...state.sel.archive];
+$('#btn-open').addEventListener('click', () => act.open(liveSel()));
+$('#btn-move').addEventListener('click', () => act.move(liveSel()));
+$('#btn-archive').addEventListener('click', () => act.archive(liveSel()));
+$('#btn-archive-offline').addEventListener('click', () => act.archive(liveSel(), true));
+$('#btn-offline').addEventListener('click', () => act.offline(liveSel()));
+$('#btn-close').addEventListener('click', () => act.del(liveSel()));
+$('#btn-snapshot').addEventListener('click', () => act.snapshot(liveSel()));
+$('#btn-restore').addEventListener('click', () => act.restore(archSel()));
+$('#btn-purge').addEventListener('click', () => act.purge(archSel()));
+$('#btn-clear').addEventListener('click', () => { state.sel.live.clear(); state.sel.archive.clear(); updateSelectionUi(); });
 
-async function doAction(fn, okText) {
-  try {
-    await fn();
-    flash(okText);
-    state.selected.clear();
-    await refresh();
-  } catch (e) { flash(e.message, true); }
-}
-
-$('#btn-open').addEventListener('click', () => {
-  const tabs = selectedRefs();
-  doAction(() => api('POST', '/api/actions/open', { tabs, targetClientId: $('#target').value, newWindow: $('#new-window').checked }),
-    `Opening ${tabs.length} tab(s) on ${targetText()}`);
-});
-$('#btn-move').addEventListener('click', () => {
-  const tabs = selectedRefs();
-  doAction(() => api('POST', '/api/actions/move', { tabs, targetClientId: $('#target').value, newWindow: $('#new-window').checked }),
-    `Moving ${tabs.length} tab(s) to ${targetText()} (sources close after they open)`);
-});
-$('#btn-close').addEventListener('click', () => {
-  const tabs = selectedRefs();
-  if (!confirm(`Close ${tabs.length} tab(s) on their source machines?`)) return;
-  doAction(() => api('POST', '/api/actions/close', { tabs }), `Closing ${tabs.length} tab(s)`);
-});
-$('#btn-snapshot').addEventListener('click', () => {
-  const tabs = selectedRefs();
-  const name = prompt('Snapshot name:', `Snapshot ${new Date().toLocaleString()}`);
-  if (name === null) return;
-  doAction(() => api('POST', '/api/snapshots', { tabs, name }), `Saved snapshot "${name}" (${tabs.length} tabs)`);
-});
-$('#filter').addEventListener('input', (e) => { state.filter = e.target.value.trim(); renderTree(); updateSelectionUi(); });
+$('#filter').addEventListener('input', (e) => { state.filter = e.target.value.trim(); renderTree(); renderOffline(); updateSelectionUi(); });
 $('#btn-expand').addEventListener('click', () => {
   state.collapsed.clear();
   localStorage.setItem('tabRelayCollapsed', '[]');
@@ -358,7 +625,7 @@ $('#btn-expand').addEventListener('click', () => {
 });
 $('#btn-collapse').addEventListener('click', () => {
   for (const n of document.querySelectorAll('#tree .node:not(.leaf)')) {
-    if (!n.classList.contains('machine')) state.collapsed.add(n.dataset.key);
+    if (!n.classList.contains('machine') && !n.classList.contains('archive-root')) state.collapsed.add(n.dataset.key);
   }
   localStorage.setItem('tabRelayCollapsed', JSON.stringify([...state.collapsed]));
   renderTree(); updateSelectionUi();

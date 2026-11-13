@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
+const { parseMhtml, renderPart } = require('./mhtml');
 
 const ONLINE_MS = 30_000;          // client counts as online if seen within this window
 const REDELIVER_MS = 60_000;       // re-send a delivered-but-unacked command after this
@@ -34,7 +35,11 @@ function idList(v) {
 }
 
 // Offline view/download links are opened by the browser directly, so they may carry ?token=.
-const QUERY_TOKEN_ROUTE = /^\/offline\/\d+\/(view|download)$/;
+const QUERY_TOKEN_ROUTE = /^\/offline\/\d+\/(view|raw|download|res\/\d+)$/;
+
+// Saved pages are untrusted: render them sandboxed with scripts and plugins disabled.
+const OFFLINE_CSP = "sandbox allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation; "
+  + "script-src 'none'; object-src 'none'";
 
 function createApp({
   db, token, now = () => Date.now(),
@@ -45,6 +50,7 @@ function createApp({
   fs.mkdirSync(offlineDir, { recursive: true });
   const app = express();
   app.disable('x-powered-by');
+  if (process.env.DEBUG_HTTP) app.use((req, res, next) => { res.on('finish', () => console.error('HTTP', req.method, req.url.slice(0, 120), res.statusCode, req.get('content-length'), req.get('origin'))); next(); });
   app.use(express.json({ limit: '20mb' }));
 
   // CORS: the extension fetches from its own origin; the web UI is same-origin.
@@ -261,6 +267,7 @@ function createApp({
 
   function removeOffline(o) {
     st.delOffline.run(o.id);   // archive_items.offline_id is set NULL by the FK
+    parsed.delete(o.file);
     fs.rm(path.join(offlineDir, o.file), { force: true }, () => {});
   }
 
@@ -608,18 +615,52 @@ function createApp({
     return { o, file };
   }
 
-  // View in the browser. Chrome renders MHTML served as multipart/related (sandboxed: no scripts).
-  app.get('/api/offline/:id/view', (req, res) => {
-    const { file } = offlineFile(req);
+  // Small cache of parsed archives (a page view pulls many sub-resources).
+  const parsed = new Map();
+  function loadMhtml(o, file) {
+    let mh = parsed.get(o.file);
+    if (!mh) {
+      mh = parseMhtml(fs.readFileSync(file));
+      parsed.set(o.file, mh);
+      if (parsed.size > 4) parsed.delete(parsed.keys().next().value);
+    }
+    return mh;
+  }
+
+  // Chrome downloads MHTML served over http instead of rendering it, so /view unpacks the archive:
+  // the main HTML is served as text/html and its images/CSS/frames point at /res/<n> of the same copy.
+  function sendPart(req, res, index) {
+    const { o, file } = offlineFile(req);
+    let mh;
+    try { mh = loadMhtml(o, file); } catch (e) { return sendRaw(res, file); }   // not parseable: raw
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const part = renderPart(mh, index ?? mh.root,
+      (i) => `${origin}/api/offline/${o.id}/res/${i}?token=${encodeURIComponent(token)}`);
+    if (!part) throw httpError(404, 'no such part');
     res.set({
-      'Content-Type': 'multipart/related',
-      'Content-Security-Policy': 'sandbox',
+      'Content-Type': part.type,
+      'Content-Security-Policy': OFFLINE_CSP,
       'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'private, max-age=3600',
       'Referrer-Policy': 'no-referrer',
     });
+    res.send(part.body);
+  }
+
+  function sendRaw(res, file) {
+    res.set({
+      'Content-Type': 'multipart/related',
+      'Content-Security-Policy': OFFLINE_CSP,
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+    });
     res.sendFile(file);
-  });
+  }
+
+  app.get('/api/offline/:id/view', (req, res) => sendPart(req, res));
+  app.get('/api/offline/:id/res/:n', (req, res) => sendPart(req, res, Number(req.params.n)));
+  // The archive itself, as multipart/related (Chrome will offer it as a download; it opens from disk).
+  app.get('/api/offline/:id/raw', (req, res) => sendRaw(res, offlineFile(req).file));
 
   app.get('/api/offline/:id/download', (req, res) => {
     const { o, file } = offlineFile(req);
