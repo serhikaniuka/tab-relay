@@ -4,3 +4,4 @@ server/data/
 *.db
 *.db-*
 claude.log
+server/server.log
