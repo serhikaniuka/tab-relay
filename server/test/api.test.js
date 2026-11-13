@@ -1,19 +1,27 @@
 'use strict';
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { openDb } = require('../src/db');
 const { createApp, REDELIVER_MS } = require('../src/app');
 
 const TOKEN = 'test-token';
-let server, base, clock = 1_700_000_000_000;
+let server, base, offlineDir, clock = 1_700_000_000_000;
+const MAX_OFFLINE = 64 * 1024;
 
 before(async () => {
-  const app = createApp({ db: openDb(':memory:'), token: TOKEN, now: () => clock });
+  offlineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tab-relay-test-'));
+  const app = createApp({ db: openDb(':memory:'), token: TOKEN, now: () => clock, offlineDir, maxOfflineBytes: MAX_OFFLINE });
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
-after(() => server.close());
+after(() => {
+  server.close();
+  fs.rmSync(offlineDir, { recursive: true, force: true });
+});
 
 async function api(method, path, body, token = TOKEN) {
   const res = await fetch(base + path, {
@@ -126,9 +134,9 @@ test('close action groups by source client', async () => {
   assert.equal(r.status, 201);
   assert.equal(r.body.commands.length, 2);
   const mac = (await api('GET', '/api/clients/mac-1/commands')).body.commands;
-  assert.deepEqual(mac.map((c) => c.payload), [{ tabIds: [101] }]);
+  assert.deepEqual(mac.map((c) => c.payload), [{ tabIds: [101], reason: 'delete' }]);
   const dev = (await api('GET', '/api/clients/dev-1/commands')).body.commands;
-  assert.deepEqual(dev.map((c) => c.payload), [{ tabIds: [100] }]);
+  assert.deepEqual(dev.map((c) => c.payload), [{ tabIds: [100], reason: 'delete' }]);
   for (const c of [...mac, ...dev]) await api('POST', `/api/commands/${c.id}/ack`, { ok: true });
 });
 
@@ -199,4 +207,202 @@ test('snapshots: save, list, restore, delete', async () => {
   assert.equal((await api('DELETE', `/api/snapshots/${sid}`)).status, 200);
   assert.equal((await api('DELETE', `/api/snapshots/${sid}`)).status, 404);
   assert.equal((await api('POST', '/api/snapshots', { tabs: [{ clientId: 'x', tabId: 1 }] })).status, 404);
+});
+
+// ---------- phase 2: move layout, closing markers, archive, offline ----------
+
+const MHTML = 'From: <Saved by Blink>\r\nSubject: Hello\r\nMIME-Version: 1.0\r\n'
+  + 'Content-Type: multipart/related; type="text/html"; boundary="B"\r\n\r\n--B\r\n'
+  + 'Content-Type: text/html\r\nContent-Location: https://example.com/a\r\n\r\n<h1>Hello offline</h1>\r\n--B--\r\n';
+
+async function upload(clientId, query, body = MHTML, headers = {}) {
+  const res = await fetch(`${base}/api/clients/${clientId}/offline?${new URLSearchParams(query)}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'multipart/related', ...headers },
+    body,
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+async function drain(clientId, ok = true) {
+  const cmds = (await api('GET', `/api/clients/${clientId}/commands`)).body.commands;
+  for (const c of cmds) await api('POST', `/api/commands/${c.id}/ack`, { ok });
+  return cmds;
+}
+
+test('two-window client: move with newWindow keeps the window layout', async () => {
+  await api('POST', '/api/clients/lap-1/state', {
+    machine: 'Laptop', profile: { email: 'work@corp.com', label: 'Work' },
+    windows: [
+      { id: 7, tabs: [{ id: 1, index: 0, url: 'https://w7/1' }, { id: 2, index: 1, url: 'https://w7/2' }] },
+      { id: 8, tabs: [{ id: 3, index: 0, url: 'https://w8/1' }] },
+    ],
+  });
+  const tabs = [1, 2, 3].map((tabId) => ({ clientId: 'lap-1', tabId }));
+  const r = await api('POST', '/api/actions/move', { targetClientId: 'dev-1', newWindow: true, tabs });
+  const [openId, closeId] = r.body.commands;
+
+  // Tree marks the source tabs as being moved.
+  const lap = (await api('GET', '/api/tree')).body.clients.find((c) => c.id === 'lap-1');
+  assert.deepEqual(lap.windows.flatMap((w) => w.tabs.map((t) => t.closing)), ['move', 'move', 'move']);
+
+  const [open] = await drain('dev-1');
+  assert.equal(open.id, openId);
+  assert.deepEqual(open.payload.windows.map((w) => w.map((t) => t.url)), [['https://w7/1', 'https://w7/2'], ['https://w8/1']]);
+  const [close] = await drain('lap-1');
+  assert.equal(close.id, closeId);
+  assert.deepEqual(close.payload, { tabIds: [1, 2, 3], reason: 'move' });
+});
+
+test('archive without offline: items stored, source closed', async () => {
+  const r = await api('POST', '/api/actions/archive', { tabs: [{ clientId: 'lap-1', tabId: 1 }, { clientId: 'lap-1', tabId: 3 }] });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.archived.length, 2);
+  assert.equal(r.body.commands.length, 1);
+
+  const items = (await api('GET', '/api/archive')).body.items;
+  const mine = items.filter((a) => r.body.archived.includes(a.id));
+  assert.deepEqual(mine.map((a) => a.url).sort(), ['https://w7/1', 'https://w8/1']);
+  assert.equal(mine[0].source.machine, 'Laptop');
+  assert.equal(mine[0].source.email, 'work@corp.com');
+  assert.equal(mine[0].offline, null);
+  assert.equal(mine[0].archivedAt, clock);
+
+  const cmds = await drain('lap-1');
+  assert.deepEqual(cmds.map((c) => [c.type, c.payload.reason]), [['close', 'archive']]);
+});
+
+test('archive + offline: capture first, upload links the copy, close follows even if capture failed', async () => {
+  const r = await api('POST', '/api/actions/archive', { offline: true, tabs: [{ clientId: 'lap-1', tabId: 2 }, { clientId: 'lap-1', tabId: 3 }] });
+  const [captureId, closeId] = r.body.commands;
+  const [aid2, aid3] = r.body.archived;
+
+  let cmds = (await api('GET', '/api/clients/lap-1/commands')).body.commands;
+  assert.deepEqual(cmds.map((c) => c.id), [captureId], 'close waits for the capture');
+  assert.equal(cmds[0].type, 'capture');
+  assert.deepEqual(cmds[0].payload.tabIds, [2, 3]);
+  assert.equal(cmds[0].payload.archiveMap[2], aid2);
+
+  const up = await upload('lap-1', { tabId: 2, commandId: captureId }, MHTML,
+    { 'x-tab-url': encodeURIComponent('https://w7/2?q=ü'), 'x-tab-title': encodeURIComponent('Заголовок') });
+  assert.equal(up.status, 201);
+  assert.equal(up.body.size, Buffer.byteLength(MHTML));
+
+  // Tab 3 could not be captured: the capture is acked as failed, the close still runs ('finish' dependency).
+  await api('POST', `/api/commands/${captureId}/ack`, { ok: false, error: 'cannot capture' });
+  cmds = (await api('GET', '/api/clients/lap-1/commands')).body.commands;
+  assert.deepEqual(cmds.map((c) => c.id), [closeId]);
+  await api('POST', `/api/commands/${closeId}/ack`, { ok: true });
+
+  const items = (await api('GET', '/api/archive')).body.items;
+  const a2 = items.find((a) => a.id === aid2);
+  const a3 = items.find((a) => a.id === aid3);
+  assert.deepEqual(a2.offline, { id: up.body.id, size: Buffer.byteLength(MHTML) });
+  assert.equal(a3.offline, null);
+
+  const off = (await api('GET', '/api/offline')).body;
+  const copy = off.items.find((o) => o.id === up.body.id);
+  assert.equal(copy.url, 'https://w7/2?q=ü');
+  assert.equal(copy.title, 'Заголовок');
+  assert.equal(copy.source.machine, 'Laptop');
+  assert.equal(off.totalSize, Buffer.byteLength(MHTML));
+});
+
+test('archive restore: grouped by source window, removed from archive after a successful open', async () => {
+  const items = (await api('GET', '/api/archive')).body.items;
+  const ids = items.map((a) => a.id);
+  assert.equal(ids.length, 4);
+
+  // remove:false keeps the items
+  let r = await api('POST', '/api/archive/restore', { ids: [ids[0]], targetClientId: 'dev-1', remove: false });
+  await drain('dev-1');
+  assert.equal((await api('GET', '/api/archive')).body.items.length, 4);
+
+  r = await api('POST', '/api/archive/restore', { ids, targetClientId: 'dev-1' });
+  assert.equal(r.status, 201);
+  const [open] = (await api('GET', '/api/clients/dev-1/commands')).body.commands;
+  assert.equal(open.payload.newWindow, true);
+  assert.equal(open.payload.tabs.length, 4);
+  assert.ok(open.payload.windows.length >= 2, 'one new window per source window/batch');
+  assert.equal((await api('GET', '/api/archive')).body.items.length, 4, 'kept until the open is acked');
+  await api('POST', `/api/commands/${open.id}/ack`, { ok: true });
+  assert.equal((await api('GET', '/api/archive')).body.items.length, 0);
+  // The offline copy survives a restore.
+  assert.equal((await api('GET', '/api/offline')).body.items.length, 1);
+
+  assert.equal((await api('POST', '/api/archive/restore', { ids: [999], targetClientId: 'dev-1' })).status, 404);
+  assert.equal((await api('POST', '/api/archive/restore', { ids, targetClientId: 'nope' })).status, 404);
+});
+
+test('offline view/download: token via header or query param only on those routes', async () => {
+  const { id } = (await api('GET', '/api/offline')).body.items[0];
+
+  let res = await fetch(`${base}/api/offline/${id}/view`);
+  assert.equal(res.status, 401);
+  res = await fetch(`${base}/api/offline/${id}/view?token=wrong`);
+  assert.equal(res.status, 401);
+  res = await fetch(`${base}/api/offline/${id}/view?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^multipart\/related/);
+  assert.equal(await res.text(), MHTML);
+
+  res = await fetch(`${base}/api/offline/${id}/download?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-disposition'), /attachment; filename=.*\.mhtml/);
+
+  // The query token is not accepted elsewhere.
+  assert.equal((await fetch(`${base}/api/tree?token=${TOKEN}`)).status, 401);
+  assert.equal((await fetch(`${base}/api/offline?token=${TOKEN}`)).status, 401);
+  assert.equal((await fetch(`${base}/api/offline/9999/view?token=${TOKEN}`)).status, 404);
+});
+
+test('save offline action, size limit, and deleting copies', async () => {
+  const r = await api('POST', '/api/actions/offline', { tabs: [{ clientId: 'mac-1', tabId: 100 }, { clientId: 'dev-1', tabId: 100 }] });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.commands.length, 2);
+  const [cap] = (await api('GET', '/api/clients/mac-1/commands')).body.commands;
+  assert.deepEqual([cap.type, cap.payload.tabIds], ['capture', [100]]);
+
+  // Without URL headers the server falls back to the stored tab's url/title.
+  const up = await upload('mac-1', { tabId: 100, commandId: cap.id });
+  assert.equal(up.status, 201);
+  await api('POST', `/api/commands/${cap.id}/ack`, { ok: true });
+  await drain('dev-1');
+  let off = (await api('GET', '/api/offline')).body;
+  const copy = off.items.find((o) => o.id === up.body.id);
+  assert.equal(copy.url, 'https://example.com/a');
+  assert.equal(copy.title, 'A');
+  assert.equal(fs.readdirSync(offlineDir).filter((f) => f.endsWith('.mhtml')).length, 2);
+
+  assert.equal((await upload('mac-1', { tabId: 100 }, 'x'.repeat(MAX_OFFLINE + 1))).status, 413);
+  assert.equal((await upload('mac-1', { tabId: 100 }, '')).status, 400);
+  assert.equal((await upload('nope', { tabId: 1 })).status, 404);
+  assert.deepEqual(fs.readdirSync(offlineDir).filter((f) => !f.endsWith('.mhtml')), [], 'no leftover partial files');
+
+  assert.equal((await api('DELETE', `/api/offline/${up.body.id}`)).status, 200);
+  assert.equal((await api('DELETE', `/api/offline/${up.body.id}`)).status, 404);
+  off = (await api('GET', '/api/offline')).body;
+  assert.equal(off.items.length, 1);
+  assert.equal(fs.readdirSync(offlineDir).filter((f) => f.endsWith('.mhtml')).length, 1);
+});
+
+test('archive delete removes items and their offline copies', async () => {
+  await api('POST', '/api/clients/lap-1/state', {
+    machine: 'Laptop', profile: { email: 'work@corp.com', label: 'Work' },
+    windows: [{ id: 9, tabs: [{ id: 20, index: 0, url: 'https://keep/1', title: 'K' }] }],
+  });
+  const r = await api('POST', '/api/actions/archive', { offline: true, tabs: [{ clientId: 'lap-1', tabId: 20 }] });
+  const up = await upload('lap-1', { tabId: 20, commandId: r.body.commands[0] });
+  await drain('lap-1');
+  await drain('lap-1');
+  const before = fs.readdirSync(offlineDir).length;
+
+  const del = await api('POST', '/api/archive/delete', { ids: r.body.archived });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.deleted, 1);
+  assert.equal((await api('GET', '/api/archive')).body.items.length, 0);
+  assert.ok(!(await api('GET', '/api/offline')).body.items.some((o) => o.id === up.body.id));
+  await new Promise((res) => setTimeout(res, 50));
+  assert.equal(fs.readdirSync(offlineDir).length, before - 1);
+  assert.equal((await api('POST', '/api/archive/delete', { ids: [] })).status, 400);
 });

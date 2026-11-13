@@ -3,5 +3,5 @@ server/.env
 server/data/
 *.db
 *.db-*
-claude.log
+claude*.log
 server/server.log

@@ -32,12 +32,16 @@ const port = Number(process.env.PORT || fileEnv.PORT || 8787);
 const dbFile = process.env.TAB_RELAY_DB || fileEnv.TAB_RELAY_DB || path.join(ROOT, 'data', 'tab-relay.db');
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
 
+const offlineDir = process.env.TAB_RELAY_OFFLINE_DIR || fileEnv.TAB_RELAY_OFFLINE_DIR || path.join(ROOT, 'data', 'offline');
+const maxOfflineMb = Number(process.env.MAX_OFFLINE_MB || fileEnv.MAX_OFFLINE_MB || 200);
+
 const db = openDb(dbFile);
-const app = createApp({ db, token });
+const app = createApp({ db, token, offlineDir, maxOfflineBytes: maxOfflineMb * 1024 * 1024 });
 
 app.listen(port, host, () => {
   console.log(`Tab Relay server listening on http://${host}:${port}`);
   console.log(`Database: ${dbFile}`);
+  console.log(`Offline copies: ${offlineDir} (max ${maxOfflineMb} MB each)`);
   console.log(`Auth token is stored in ${ENV_FILE} (TAB_RELAY_TOKEN)`);
 });
 
