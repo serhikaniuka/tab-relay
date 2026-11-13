@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tab Relay options</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; max-width: 560px; margin: 30px auto; padding: 0 16px; color: #1d1d1f; }
+  h1 { font-size: 20px; }
+  label { display: block; margin: 14px 0 4px; font-weight: 500; }
+  input { width: 100%; box-sizing: border-box; font: inherit; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; }
+  .hint { color: #6e6e73; font-size: 12px; margin-top: 3px; }
+  button { margin-top: 18px; font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid #2563eb; background: #2563eb; color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: #2563eb; }
+  #result { margin-top: 14px; white-space: pre-wrap; }
+  .ok { color: #16a34a; } .err { color: #c62828; }
+  table { margin-top: 24px; border-collapse: collapse; font-size: 13px; }
+  td { padding: 3px 12px 3px 0; vertical-align: top; } td:first-child { color: #6e6e73; }
+  code { word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Tab Relay</h1>
+<form id="form">
+  <label for="serverUrl">Server URL</label>
+  <input id="serverUrl" type="url" placeholder="http://192.168.1.103:8787" required>
+
+  <label for="token">Token</label>
+  <input id="token" type="password" placeholder="TAB_RELAY_TOKEN from server/.env" required autocomplete="off">
+
+  <label for="machine">Machine name</label>
+  <input id="machine" type="text" placeholder="MacBook, devbox, …" required>
+
+  <label for="profileLabel">Profile label <span class="hint">(optional)</span></label>
+  <input id="profileLabel" type="text" placeholder="Work, Personal, …">
+  <div class="hint">Shown next to the Google account. Chrome does not expose the profile name to extensions.</div>
+
+  <button type="submit">Save &amp; sync</button>
+  <button type="button" id="openUi" class="secondary">Open web UI</button>
+</form>
+<div id="result"></div>
+
+<table>
+  <tr><td>Google account</td><td id="account">…</td></tr>
+  <tr><td>Client id</td><td><code id="clientId">…</code></td></tr>
+  <tr><td>Last sync</td><td id="lastPush">never</td></tr>
+  <tr><td>Last error</td><td id="lastError">—</td></tr>
+</table>
+<script src="options.js"></script>
+</body>
+</html>

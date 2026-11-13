@@ -5,7 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 const REFRESH_MS = 4000;
 
 const state = {
-  token: localStorage.getItem('tabRelayToken') || new URLSearchParams(location.hash.slice(1)).get('token') || '',
+  token: new URLSearchParams(location.hash.slice(1)).get('token') || localStorage.getItem('tabRelayToken') || '',
   tree: null,
   snapshots: [],
   commands: [],
