@@ -223,7 +223,7 @@ function saveAsMHTML(tabId) {
   });
 }
 
-async function uploadCapture(cfg, clientId, cmdId, tab, blob) {
+async function uploadCapture(cfg, clientId, cmdId, tab, body) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS);
   try {
@@ -236,7 +236,7 @@ async function uploadCapture(cfg, clientId, cmdId, tab, blob) {
         'x-tab-url': encodeURIComponent((tab.url || '').slice(0, 4000)),
         'x-tab-title': encodeURIComponent((tab.title || '').slice(0, 500)),
       },
-      body: blob,
+      body,
       signal: ctrl.signal,
     });
     const data = await res.json().catch(() => ({}));
@@ -255,10 +255,15 @@ async function execCapture(cmd, cfg, clientId) {
     for (const tabId of cmd.payload.tabIds || []) {
       try {
         const tab = await ensureLoaded(tabId);
-        const blob = await saveAsMHTML(tabId);
         let r;
-        for (let attempt = 1; ; attempt++) {   // retry transient network errors
-          try { r = await uploadCapture(cfg, clientId, cmd.id, tab, blob); break; } catch (e) {
+        for (let attempt = 1; ; attempt++) {   // retry transient capture/network errors
+          try {
+            // The capture Blob is backed by a temporary file that can disappear before fetch streams
+            // it ("Failed to fetch"), so copy it into memory right away.
+            const data = await (await saveAsMHTML(tabId)).arrayBuffer();
+            r = await uploadCapture(cfg, clientId, cmd.id, tab, data);
+            break;
+          } catch (e) {
             if (attempt >= 3 || /^HTTP 4/.test(e.message)) throw e;
             await new Promise((res) => setTimeout(res, attempt * 1500));
           }
