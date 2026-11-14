@@ -84,6 +84,17 @@ CREATE TABLE IF NOT EXISTS archive_items (
   offline_id       INTEGER REFERENCES offline_pages(id) ON DELETE SET NULL
 );
 
+-- Short page descriptions per URL (from the live page via the extension, a server-side fetch,
+-- or an MHTML capture). Kept independently of tabs so archived tabs keep theirs.
+CREATE TABLE IF NOT EXISTS page_meta (
+  url                TEXT PRIMARY KEY,
+  description        TEXT NOT NULL DEFAULT '',
+  source             TEXT NOT NULL DEFAULT '',   -- page | fetch | mhtml
+  updated_at         INTEGER NOT NULL,
+  fetch_attempted_at INTEGER,
+  fetch_error        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT NOT NULL,

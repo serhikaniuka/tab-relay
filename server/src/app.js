@@ -4,10 +4,12 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const { parseMhtml, renderPart } = require('./mhtml');
+const { extractDescription, clampDescription, MetaFetcher } = require('./meta');
 
 const ONLINE_MS = 30_000;          // client counts as online if seen within this window
 const REDELIVER_MS = 60_000;       // re-send a delivered-but-unacked command after this
 const MAX_FAVICON = 16_384;        // drop huge data: favicons
+const META_RETRY_MS = 24 * 3600_000; // retry a failed description fetch after a day
 
 function str(v, max = 4096) {
   return typeof v === 'string' ? v.slice(0, max) : '';
@@ -45,6 +47,9 @@ function createApp({
   db, token, now = () => Date.now(),
   offlineDir = path.join(__dirname, '..', 'data', 'offline'),
   maxOfflineBytes = 200 * 1024 * 1024,
+  // Server-side description fetch fallback: false to disable, or MetaFetcher options
+  // ({allowPrivate, delayMs, perHostIntervalMs, timeoutMs, concurrency}).
+  metaFetch = {},
 }) {
   if (!token) throw new Error('token is required');
   fs.mkdirSync(offlineDir, { recursive: true });
@@ -90,7 +95,23 @@ function createApp({
       VALUES (@client_id, @tab_id, @window_id, @idx, @url, @title, @fav_icon_url, @pinned, @active, @last_seen)`),
     allClients: db.prepare('SELECT * FROM clients ORDER BY machine, profile_email, profile_label'),
     allWindows: db.prepare('SELECT * FROM windows ORDER BY client_id, window_id'),
-    allTabs: db.prepare('SELECT * FROM tabs ORDER BY client_id, window_id, idx'),
+    allTabs: db.prepare(`SELECT t.*, m.description FROM tabs t LEFT JOIN page_meta m ON m.url = t.url
+      ORDER BY t.client_id, t.window_id, t.idx`),
+    getMeta: db.prepare('SELECT * FROM page_meta WHERE url = ?'),
+    // A description read from the live page always wins.
+    metaFromPage: db.prepare(`INSERT INTO page_meta (url, description, source, updated_at) VALUES (?, ?, 'page', ?)
+      ON CONFLICT(url) DO UPDATE SET description = excluded.description, source = 'page', updated_at = excluded.updated_at,
+        fetch_error = NULL`),
+    // Fetched / MHTML descriptions only fill a gap.
+    metaFallback: db.prepare(`INSERT INTO page_meta (url, description, source, updated_at) VALUES (@url, @d, @source, @now)
+      ON CONFLICT(url) DO UPDATE SET description = @d, source = @source, updated_at = @now, fetch_error = NULL
+      WHERE page_meta.description = ''`),
+    metaFetchResult: db.prepare(`INSERT INTO page_meta (url, description, source, updated_at, fetch_attempted_at, fetch_error)
+      VALUES (@url, @d, CASE WHEN @d = '' THEN '' ELSE 'fetch' END, @now, @now, @err)
+      ON CONFLICT(url) DO UPDATE SET fetch_attempted_at = @now, fetch_error = @err,
+        description = CASE WHEN page_meta.description = '' THEN @d ELSE page_meta.description END,
+        source = CASE WHEN page_meta.description = '' AND @d <> '' THEN 'fetch' ELSE page_meta.source END,
+        updated_at = CASE WHEN page_meta.description = '' AND @d <> '' THEN @now ELSE page_meta.updated_at END`),
     getTab: db.prepare('SELECT * FROM tabs WHERE client_id = ? AND tab_id = ?'),
     deleteClient: db.prepare('DELETE FROM clients WHERE id = ?'),
     countClientData: db.prepare(`SELECT
@@ -133,8 +154,9 @@ function createApp({
        fav_icon_url, pinned, archived_at)
       VALUES (@batch_id, @source_client_id, @machine, @profile_email, @profile_label, @window_id, @idx, @url,
        @title, @fav_icon_url, @pinned, @archived_at)`),
-    allArchive: db.prepare(`SELECT a.*, o.size AS offline_size FROM archive_items a
+    allArchive: db.prepare(`SELECT a.*, o.size AS offline_size, m.description FROM archive_items a
       LEFT JOIN offline_pages o ON o.id = a.offline_id
+      LEFT JOIN page_meta m ON m.url = a.url
       ORDER BY a.machine, a.profile_email, a.archived_at DESC, a.window_id, a.idx`),
     getArchive: db.prepare('SELECT * FROM archive_items WHERE id = ?'),
     delArchive: db.prepare('DELETE FROM archive_items WHERE id = ?'),
@@ -143,7 +165,8 @@ function createApp({
       (client_id, machine, profile_email, profile_label, tab_id, url, title, fav_icon_url, file, size, created_at)
       VALUES (@client_id, @machine, @profile_email, @profile_label, @tab_id, @url, @title, @fav_icon_url, @file,
        @size, @created_at)`),
-    allOffline: db.prepare('SELECT * FROM offline_pages ORDER BY id DESC'),
+    allOffline: db.prepare(`SELECT o.*, m.description FROM offline_pages o LEFT JOIN page_meta m ON m.url = o.url
+      ORDER BY o.id DESC`),
     getOffline: db.prepare('SELECT * FROM offline_pages WHERE id = ?'),
     delOffline: db.prepare('DELETE FROM offline_pages WHERE id = ?'),
   };
@@ -166,6 +189,7 @@ function createApp({
     pinned: !!t.pinned,
     active: !!t.active,
     lastSeen: t.last_seen,
+    description: t.description || '',
   });
 
   const commandView = (c) => ({
@@ -190,6 +214,7 @@ function createApp({
     favIconUrl: o.fav_icon_url,
     size: o.size,
     createdAt: o.created_at,
+    description: o.description || '',
   });
 
   const archiveView = (a) => ({
@@ -204,7 +229,27 @@ function createApp({
     pinned: !!a.pinned,
     archivedAt: a.archived_at,
     offline: a.offline_id ? { id: a.offline_id, size: a.offline_size } : null,
+    description: a.description || '',
   });
+
+  // ---------- page descriptions ----------
+  const fetcher = metaFetch === false ? null : new MetaFetcher({
+    ...metaFetch,
+    store: (url, d, err) => st.metaFetchResult.run({ url, d: clampDescription(d), err: err ? String(err).slice(0, 300) : null, now: now() }),
+    stillMissing: (url) => !st.getMeta.get(url)?.description,
+  });
+  app.locals.metaFetcher = fetcher;
+
+  // Queue a server-side fetch for URLs with no description that weren't tried recently.
+  function wantDescriptions(urls) {
+    if (!fetcher) return;
+    for (const url of new Set(urls)) {
+      if (!/^https?:\/\//i.test(url)) continue;
+      const m = st.getMeta.get(url);
+      if (m && (m.description || (m.fetch_attempted_at && now() - m.fetch_attempted_at < META_RETRY_MS))) continue;
+      fetcher.enqueue(url);
+    }
+  }
 
   function requireClient(id) {
     const c = st.getClient.get(id);
@@ -303,6 +348,7 @@ function createApp({
     const profile = b.profile || {};
     const windows = Array.isArray(b.windows) ? b.windows : [];
     let tabCount = 0;
+    const undescribed = [];
     db.transaction(() => {
       st.upsertClient.run({
         id,
@@ -334,10 +380,15 @@ function createApp({
             active: tab.active ? 1 : 0,
             last_seen: t,
           });
+          const url = str(tab.url, 8192);
+          const d = clampDescription(str(tab.description, 2000));
+          if (d && url) st.metaFromPage.run(url, d, t);
+          else if (url) undescribed.push(url);
           tabCount++;
         }
       }
     })();
+    wantDescriptions(undescribed);
     res.json({ ok: true, tabs: tabCount });
   });
 
@@ -425,6 +476,14 @@ function createApp({
           }
           return offlineId;
         })();
+        // The capture's HTML can provide a description if the page had none yet.
+        try {
+          const mh = parseMhtml(fs.readFileSync(path.join(offlineDir, name)));
+          const root = mh.parts[mh.root];
+          const d = extractDescription(new TextDecoder(root.charset || 'utf-8').decode(root.body));
+          const url = decodeHeader(req.get('x-tab-url'), 8192) || tab?.url || mh.url;
+          if (d && url) st.metaFallback.run({ url, d, source: 'mhtml', now: now() });
+        } catch (e) { /* not a parseable capture: no description */ }
         res.status(201).json({ id, size });
       } catch (e) {
         fail(e);
@@ -598,10 +657,21 @@ function createApp({
       }
       return { batchId: batch, archived: archiveIds, commands };
     })();
+    wantDescriptions(rows.map((r) => r.url));
     res.status(201).json(result);
   });
 
   // ---------- archive ----------
+
+  // Stored description for one URL (mostly for debugging).
+  app.get('/api/meta', (req, res) => {
+    const url = str(req.query.url, 8192);
+    if (!url) throw httpError(400, 'url required');
+    const m = st.getMeta.get(url);
+    if (!m) throw httpError(404, 'no metadata for this url');
+    res.json({ url: m.url, description: m.description, source: m.source, updatedAt: m.updated_at,
+      fetchAttemptedAt: m.fetch_attempted_at, fetchError: m.fetch_error });
+  });
 
   app.get('/api/archive', (req, res) => {
     res.json({ items: st.allArchive.all().map(archiveView) });

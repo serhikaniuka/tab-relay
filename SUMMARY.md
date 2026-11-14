@@ -123,3 +123,52 @@ Data locations (all git-ignored):
   - prune by age.
 - **The live DB is cleaned up:** the stale duplicate `f3c968f5-50e9-4cf1-aa18-2d8ee5e613e8` (devbox / personal, 11 tabs, seen only at creation) is removed through the new endpoint. `d78e7dae-…` is kept.
 - **⚠ Reload the extension on every machine** (the reload button on its card in `chrome://extensions`, or Load unpacked again after pulling) to pick up the fix (v0.2.1). Existing clients keep their stored id, so nothing changes for them; the fix prevents new duplicates on fresh installs and new profiles.
+
+## Phase 4: table view with page descriptions
+
+- **Table view (the default)** with the columns **URL**, **Title** and **Description**.
+  - URL: shortened in the middle, full on hover, clickable, with a favicon.
+  - Title: with its badges (pinned / moving… / offline).
+  - Description: up to 2 lines, "—" when unknown.
+  - Machine → profile → window are **group header rows** with tri-state checkboxes, collapse arrows and hover actions. Profile rows (and single-profile machine rows) are drop targets.
+  - Every leaf row has a checkbox, is draggable (a selected row drags the whole selection) and has hover buttons (Move / Archive / Archive+offline / Offline / Delete).
+  - The column header stays visible under the sticky toolbar.
+  - The **Archive** is a table too, with an extra **Archived** column, grouped Archive → machine → profile → date (Restore / Delete).
+  - **Tree view** in the toolbar switches back to the old tree, and the choice is remembered. Both views are rendered from one model, so all actions work the same in both.
+  - The filter also searches descriptions.
+- **Descriptions from the live page (extension 0.3.0):**
+  - `chrome.scripting.executeScript` reads `meta description` → `og:description` → `twitter:description` → the first paragraph with real text.
+  - It runs when a tab finishes loading, on single-page-app URL changes, and for existing tabs at startup and install.
+  - Results are cached per URL in `chrome.storage.session` and sent with the state push.
+  - Skipped: `chrome://`, the Web Store, extension pages, `file://`; failed attempts are retried after 10 min.
+  - New permissions: `scripting` and host access `<all_urls>`, which replaces the per-server optional host permission.
+- **Server `page_meta` table** (url → description, source page / fetch / mhtml, fetch attempt and error):
+  - The tree, archive and offline lists join descriptions by URL, so archived tabs and offline copies keep them.
+  - A live-page description always wins; fetched and MHTML ones only fill gaps. Descriptions are trimmed to about 200 characters at a word boundary.
+  - `GET /api/meta?url=` shows what is stored for a URL.
+- **Server fetch fallback** for http(s) tabs without a description, e.g. discarded or unloaded tabs and archived tabs:
+  - waits 15 s first, so the extension has the first chance;
+  - 2 requests at a time, 1 request per host every 2 s, at most 500 queued;
+  - 5 s deadline, 512 KB cap, 3 redirects, HTML only, respects the page's charset (e.g. windows-1251);
+  - a failed fetch is retried after 24 h at the earliest;
+  - `TAB_RELAY_META_FETCH=0` turns it off.
+- **The fallback is LAN-safe:**
+  - Private, loopback, link-local, CGNAT, multicast and reserved IPv4/IPv6 addresses (including v4-mapped) are refused.
+  - Every DNS answer, IP-literal host and redirect hop is checked, and the connection goes to the checked address.
+  - The tests caught that IP-literal URLs (`http://127.0.0.1/…`) skipped Node's custom `lookup`; they are now checked explicitly.
+  - Checked against the real network: Wikipedia, GitHub, pravda.com.ua (Ukrainian) and example.com get descriptions; `192.168.1.103` and `localhost` are blocked.
+- **MHTML uploads** fill in a missing description from the captured HTML.
+- **Tests:** 33 pass. 24 are API tests; 9 new ones in `test/meta.test.js` use a local test website:
+  - extraction rules, clamping, inline-tag spacing;
+  - the private-address table;
+  - the guarded fetch: blocking of 127.0.0.1 / localhost / `[::1]` / decimal IP / 192.168.x, file: and ftp:; redirects, 404, non-HTML, redirect loop, redirect to ftp; the 5 s deadline (tested with a short one); the size cap against an endless response; windows-1251;
+  - queue rate limit, concurrency and bound;
+  - page_meta priorities, the retry window, the archive keeping descriptions, the default fetcher refusing LAN URLs, and MHTML-derived descriptions.
+- **e2e** (`scripts/e2e.js`, two Chromium profiles): it now also checks that:
+  - descriptions from the live pages (meta tag, and the paragraph fallback clamped to 198 chars) reach the server;
+  - the table cells show URL / title / description;
+  - the archived row keeps its description;
+  - the tree-view toggle works.
+  - All earlier steps still pass on the table: drag & drop move, archive + offline, restore, delete, Remove client.
+- **⚠ Reload the extension on every machine** (the reload button on its card in `chrome://extensions`, or Load unpacked again after pulling). Version 0.3.0 **asks for new permissions**: "Read and change all your data on all websites" (`<all_urls>`, needed to read page descriptions) and `scripting`. Chrome may disable the extension until you accept them; re-enable it on its card.
+  - Until it's reloaded, the old extension sends no descriptions; the server fallback fills them in for public pages only.

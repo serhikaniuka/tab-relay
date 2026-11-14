@@ -35,6 +35,7 @@ Optional settings, either in `server/.env` or as environment variables:
 - `TAB_RELAY_DB` (default `server/data/tab-relay.db`)
 - `TAB_RELAY_OFFLINE_DIR`: where offline copies are stored (default `server/data/offline/`)
 - `MAX_OFFLINE_MB`: the size limit for one captured page (default 200)
+- `TAB_RELAY_META_FETCH=0`: turns off the server-side description fetch (see "Page descriptions" below)
 
 ### Keep it running
 
@@ -85,7 +86,7 @@ Set `E2E_REAL_URL=https://…` to also capture a real website.
    - **Profile label** (optional): e.g. `Work`. Chrome doesn't tell extensions the profile name, so you can set it here.
 5. Click **Save & sync** and allow access to the server when Chrome asks. The page should report "Connected".
 
-After updating the extension (version 0.2 adds the `pageCapture` permission), click the reload icon on its card in `chrome://extensions` on every machine.
+After updating the extension, click the reload icon on its card in `chrome://extensions` on every machine. Version 0.2 added `pageCapture`. Version 0.3 adds `scripting` and access to all sites (`<all_urls>`), which it uses to read page descriptions; Chrome asks you to accept or re-enable the extension.
 
 Repeat this for each Chrome profile you want to see. Each profile gets its own stable client id. The Google account is read with `chrome.identity.getProfileUserInfo`. If the profile isn't signed in to Chrome, it shows as "not signed in".
 
@@ -95,6 +96,7 @@ Click the extension's toolbar icon to open the web UI. The token is passed in th
 
 Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localStorage).
 
+- Tabs are shown as a **table** with the columns **URL** (shortened; hover for the full URL; click to open), **Title** and **Description** (a 1–2 sentence summary of the page; "—" when unknown). Machine → profile → window are **group header rows** with their own checkboxes. The Archive table adds an **Archived** column and groups by machine → profile → date. **Tree view** in the toolbar switches back to the old tree; the choice is remembered.
 - Tick checkboxes on machines, profiles, windows or single tabs. The filter box narrows the tree. All toolbar buttons are bulk actions on the current selection.
 - Hovering over any tab, window, profile or machine shows quick buttons for that node: **Move, Archive, Archive+offline, Offline, Delete**. Archive nodes show **Restore** and **Delete**.
 - Pick a **Target** client. With **new window** ticked, the tabs open in new windows, one per source window, so moving a whole profile keeps its window layout.
@@ -134,6 +136,25 @@ Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localS
 
 ## How it works
 
+### Page descriptions
+
+No AI service is involved; descriptions come from the pages themselves.
+
+1. **Extension (main source):** when a tab finishes loading, and for already-open tabs at startup, it runs a small function in the page with `chrome.scripting.executeScript`. The function returns:
+   - `<meta name="description">`, otherwise `og:description`, otherwise `twitter:description`;
+   - otherwise the first paragraph with at least 40 characters that isn't in the nav, header or footer.
+
+   Results are cached per URL (in `chrome.storage.session`) and sent with the state push. Pages extensions can't script are skipped: `chrome://`, the Web Store, other extensions, `file://`, and error and PDF pages.
+2. **Server `page_meta` table:** descriptions are stored per URL, so archived tabs and offline copies keep theirs after the tab is closed. They are trimmed to about 200 characters at a word boundary. A description from the live page always wins.
+3. **Server fetch fallback:** used for http(s) tabs without a description, e.g. discarded or unloaded tabs, or pages whose description is empty. The server fetches the page itself, applies the same rules, and limits itself as follows:
+   - waits 15 s first, to give the extension a chance;
+   - 2 requests at a time, at most 1 request per host every 2 s, at most 500 queued;
+   - 5 s deadline, reads at most 512 KB, at most 3 redirects, HTML only;
+   - honours the page's charset (e.g. windows-1251).
+
+   It is **LAN-safe**: every resolved address, including IP-literal hosts and every redirect hop, is checked. Private, loopback, link-local, CGNAT, multicast and reserved ranges (IPv4 and IPv6, including v4-mapped) are refused, and the connection goes to the address that was checked. So LAN pages such as `192.168.x.x` or `localhost` never get a server-side description. A failed fetch is retried after 24 h at the earliest.
+4. **Offline copies:** when an MHTML capture is uploaded, its HTML provides a description if the URL had none.
+
 - The extension pushes the full tab state on tab and window events (debounced by 1 s) and every 10 s. It polls `GET /api/clients/:id/commands` every 3 s. A `chrome.alarms` tick every 30 s restarts the loop if Chrome suspended the service worker.
 - Once delivered, a command isn't sent again unless it stays unacked for 60 s. The extension also remembers which command ids it has already run, so a lost ack doesn't make it open the tabs twice.
 - In a move, each close command depends on the open command. The server releases the close only after the open is acked as successful. If the open fails, the close is cancelled.
@@ -158,6 +179,7 @@ Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localS
 | `POST /api/archive/delete` | `{ids}` → permanent delete, including the offline copies |
 | `POST /api/clients/:id/offline?tabId=&commandId=` | extension: upload MHTML (raw body, `X-Tab-Url` / `X-Tab-Title` URI-encoded) |
 | `GET /api/offline` | offline copies and their total size |
+| `GET /api/meta?url=` | the stored description for a URL (source: page / fetch / mhtml, last fetch error) |
 | `GET /api/offline/:id/view` · `/res/:n` · `/raw` · `/download` | reader view, its parts, raw `multipart/related`, download |
 | `DELETE /api/offline/:id` | delete an offline copy |
 | `POST /api/commands` | raw command `{clientId, type:'open', urls, newWindow}` or `{clientId, type:'close', tabIds}` |
@@ -177,4 +199,6 @@ Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localS
    - **Архів:** «Archive» закриває вкладки й зберігає їх на сервері (групування: машина → профіль → дата). «Restore to target» відкриває їх знову на вибраному клієнті, «Delete permanently» видаляє назавжди.
    - **Офлайн-копії:** «Save offline» зберігає сторінку як MHTML на сервері, а «Archive + save offline» робить те саме й одразу архівує вкладку. Значок **offline** відкриває збережену копію навіть тоді, коли сайт недоступний. Розмір копій видно на панелі «Offline copies», там же їх можна видалити.
    - **Видалення:** «Delete» закриває вкладки без архівування (після підтвердження).
+   - **Таблиця:** вкладки показано таблицею з колонками URL, назва та короткий опис сторінки. Опис береться з самої сторінки (meta description / og:description / перший абзац), а якщо вкладка не завантажена — сервер завантажує сторінку сам (лише публічні адреси, не локальна мережа). Кнопка «Tree view» повертає старий вигляд дерева.
+   - Після оновлення до версії 0.3 перезавантажте розширення в `chrome://extensions`: Chrome попросить нові дозволи (`scripting`, доступ до всіх сайтів).
    - Після оновлення розширення натисніть «Оновити» (reload) на його картці в `chrome://extensions`: версія 0.2 потребує дозволу `pageCapture`.

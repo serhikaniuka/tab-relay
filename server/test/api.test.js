@@ -13,7 +13,7 @@ const MAX_OFFLINE = 64 * 1024;
 
 before(async () => {
   offlineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tab-relay-test-'));
-  const app = createApp({ db: openDb(':memory:'), token: TOKEN, now: () => clock, offlineDir, maxOfflineBytes: MAX_OFFLINE });
+  const app = createApp({ db: openDb(':memory:'), token: TOKEN, now: () => clock, offlineDir, maxOfflineBytes: MAX_OFFLINE, metaFetch: false });
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;

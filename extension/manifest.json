@@ -1,12 +1,30 @@
 {
   "manifest_version": 3,
   "name": "Tab Relay",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Sync this Chrome profile's tabs to a Tab Relay server and open/close tabs on request.",
-  "permissions": ["tabs", "storage", "alarms", "identity", "identity.email", "pageCapture"],
-  "optional_host_permissions": ["http://*/*", "https://*/*"],
-  "background": { "service_worker": "background.js" },
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "identity",
+    "identity.email",
+    "pageCapture",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "options_page": "options.html",
-  "action": { "default_title": "Tab Relay: open the web UI" },
-  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  "action": {
+    "default_title": "Tab Relay: open the web UI"
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
 }

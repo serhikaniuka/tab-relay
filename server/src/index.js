@@ -36,7 +36,9 @@ const offlineDir = process.env.TAB_RELAY_OFFLINE_DIR || fileEnv.TAB_RELAY_OFFLIN
 const maxOfflineMb = Number(process.env.MAX_OFFLINE_MB || fileEnv.MAX_OFFLINE_MB || 200);
 
 const db = openDb(dbFile);
-const app = createApp({ db, token, offlineDir, maxOfflineBytes: maxOfflineMb * 1024 * 1024 });
+// Server-side page description fetch (fallback for tabs the extension couldn't read). Public hosts only.
+const metaFetch = (process.env.TAB_RELAY_META_FETCH || fileEnv.TAB_RELAY_META_FETCH) === '0' ? false : {};
+const app = createApp({ db, token, offlineDir, maxOfflineBytes: maxOfflineMb * 1024 * 1024, metaFetch });
 
 const server = app.listen(port, host, () => {
   console.log(`Tab Relay server listening on http://${host}:${port}`);

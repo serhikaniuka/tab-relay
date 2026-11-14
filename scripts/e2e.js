@@ -31,7 +31,9 @@ const step = (s) => console.log('✓', s);
 const site = http.createServer((req, res) => {
   const name = req.url.replace(/\W/g, '') || 'root';
   res.setHeader('content-type', 'text/html; charset=utf-8');
-  res.end(`<!doctype html><title>Page ${name}</title><style>h1{color:rgb(200,0,0)}</style><h1 id="h">Hello offline ${name}</h1><p>${'lorem ipsum '.repeat(200)}</p>`);
+  // /one and /two have a meta description; /three only paragraphs (extension falls back to the first one).
+  const meta = name === 'three' ? '' : `<meta name="description" content="Description of page ${name} &amp; more.">`;
+  res.end(`<!doctype html><title>Page ${name}</title>${meta}<style>h1{color:rgb(200,0,0)}</style><h1 id="h">Hello offline ${name}</h1><p>${'lorem ipsum '.repeat(200)}</p>`);
 });
 
 async function browser(name) {
@@ -69,6 +71,13 @@ async function browser(name) {
     if (all.length !== 2) throw new Error(`expected exactly 2 clients (one per profile), got ${all.length}: ${all.map((c) => c.machine + ':' + c.id)}`);
     step('two clients pushed their tabs, exactly one client id per profile');
 
+    // Descriptions read from the live pages by the extension (chrome.scripting).
+    const descOf = async (p) => (await tab(p))?.description;
+    await until(async () => (await descOf('one')) === 'Description of page one & more.' && (await descOf('three'))?.startsWith('lorem ipsum'), 'descriptions pushed');
+    const d3 = await descOf('three');
+    if (d3.length > 200) throw new Error('description not clamped: ' + d3.length);
+    step(`descriptions from the extension: "${await descOf('one')}" / "${d3.slice(0, 30)}…" (${d3.length} chars)`);
+
     // 1. Save offline
     await api('POST', '/api/actions/offline', { tabs: [{ clientId: alpha.id, tabId: (await tab('one')).id }] });
     const copy = await until(async () => (await api('GET', '/api/offline')).items.find((o) => o.url === `${SITE}/one`), 'offline copy uploaded');
@@ -86,20 +95,33 @@ async function browser(name) {
     // 3. Web UI: drag a tab from alpha onto beta's profile node => move
     const ui = await B.newPage();
     await ui.goto(`${BASE}/#token=${TOKEN}`);
-    await ui.waitForSelector('#tree .tab');
-    await ui.locator('#tree > .machine .tab .row', { hasText: 'Page three' }).first()
-      .dragTo(ui.locator('#tree > .machine .profile > .row', { hasText: 'beta-prof' }));
+    await ui.waitForSelector('table.tt:not(.archive) tr.leaf');
+    // The table shows URL, title and description columns.
+    const row1 = ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page one' }).first();
+    const cells = await row1.locator('td').allInnerTexts();
+    if (!cells[1].includes('127.0.0.1:8798/one') || !cells[2].includes('Page one') || !cells[3].includes('Description of page one'))
+      throw new Error('table cells: ' + JSON.stringify(cells));
+    step(`table row: ${JSON.stringify(cells.slice(1, 4).map((c) => c.split('\n')[0]))}`);
+    await ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page three' }).first()
+      .dragTo(ui.locator('table.tt:not(.archive) tr.grp.profile', { hasText: 'beta-prof' }));
     await until(async () => (await tabsOf('beta')).some((t) => t.url === `${SITE}/three`), 'moved tab opened on beta');
     await until(async () => !(await tab('three')), 'moved tab closed on alpha');
     step('drag & drop move alpha → beta');
 
     // 4. UI shows the archive section and offline badges
     await ui.reload();
-    await ui.waitForSelector('.archive-root .tab');
-    const archiveText = await ui.textContent('.archive-root');
+    await ui.waitForSelector('table.tt.archive tr.leaf');
+    const archiveText = await ui.textContent('table.tt.archive');
+    if (!archiveText.includes('Description of page two')) throw new Error('archived tab lost its description');
     if (!archiveText.includes('alpha') || !archiveText.includes('Page two')) throw new Error('archive not rendered: ' + archiveText);
     const badges = await ui.locator('.badge.offline').count();
-    await ui.screenshot({ path: path.join(WORK, 'ui.png') });
+    await ui.screenshot({ path: path.join(WORK, 'ui.png'), fullPage: true });
+    // The old tree view is one click away and still works.
+    await ui.click('#btn-view');
+    await ui.waitForSelector('#tree .node.leaf');
+    await ui.screenshot({ path: path.join(WORK, 'ui-tree.png') });
+    await ui.click('#btn-view');
+    await ui.waitForSelector('table.tt tr.leaf');
     step(`UI: archive section rendered, ${badges} offline badges`);
 
     // 5. Site goes away; saved copies still render in the browser
@@ -117,9 +139,9 @@ async function browser(name) {
     // 6. Restore from the archive via the UI button onto alpha
     await ui.bringToFront();
     await ui.reload();
-    await ui.waitForSelector('.archive-root .tab');
+    await ui.waitForSelector('table.tt.archive tr.leaf');
     await ui.selectOption('#target', alpha.id);
-    await ui.locator('.archive-root > .row input[type=checkbox]').check();
+    await ui.locator('table.tt.archive tr.grp.archive-root input[type=checkbox]').check();
     await ui.click('#btn-restore');
     await until(async () => (await tabsOf('alpha')).some((t) => t.url === `${SITE}/two`), 'restored on alpha');
     await until(async () => (await api('GET', '/api/archive')).items.length === 0, 'archive emptied');
@@ -128,8 +150,8 @@ async function browser(name) {
     // 7. Delete (close without archive) via the UI, with confirmation
     ui.once('dialog', (d) => d.accept());
     await ui.reload();
-    await ui.waitForSelector('#tree .tab');
-    await ui.locator('#tree > .machine .tab .row', { hasText: `${SITE}/two` }).first().locator('input').check();
+    await ui.waitForSelector('table.tt:not(.archive) tr.leaf');
+    await ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page two' }).first().locator('input').check();
     await ui.click('#btn-close');
     await until(async () => !(await tab('two')), 'deleted tab closed');
     if ((await api('GET', '/api/archive')).items.length) throw new Error('delete must not archive');
@@ -139,7 +161,7 @@ async function browser(name) {
     await api('POST', '/api/clients/ghost-client/state', { machine: 'ghost', profile: { label: 'stale' }, windows: [{ id: 1, tabs: [{ id: 1, url: 'https://ghost/' }] }] });
     await sleep(31000);   // let it go offline
     await ui.reload();
-    const ghostRow = ui.locator('#tree > .machine .profile > .row', { hasText: 'stale' });
+    const ghostRow = ui.locator('table.tt:not(.archive) tr.grp.profile', { hasText: 'stale' });
     await ghostRow.waitFor();
     ui.once('dialog', (d) => d.accept());
     await ghostRow.getByRole('button', { name: 'Remove' }).click();

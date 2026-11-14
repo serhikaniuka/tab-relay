@@ -84,8 +84,102 @@ const configured = (cfg) => !!(cfg.serverUrl && cfg.token);
 
 // ---------- state push ----------
 
+// ---------- page descriptions ----------
+// Read from the live page (meta description / og / twitter, else the first real paragraph) with
+// chrome.scripting, cached per URL in storage.session (survives service-worker restarts), and sent
+// with the state push. Pages extensions can't script (chrome://, Web Store, …) are skipped.
+
+const DESC_MAX = 400;            // the server trims to ~200 for display
+const DESC_CACHE_MAX = 1500;
+const DESC_RETRY_MS = 10 * 60_000;
+
+// Runs inside the page: must be self-contained.
+function pageDescription() {
+  const meta = (sel) => document.querySelector(sel)?.getAttribute('content')?.trim();
+  let d = meta('meta[name="description" i]') || meta('meta[property="og:description" i]')
+    || meta('meta[name="og:description" i]') || meta('meta[name="twitter:description" i]')
+    || meta('meta[property="twitter:description" i]');
+  if (!d) {
+    for (const p of document.querySelectorAll('main p, article p, p')) {
+      if (p.closest('nav, header, footer, aside')) continue;
+      const t = (p.innerText || p.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t.length >= 40) { d = t; break; }
+    }
+  }
+  return (d || '').replace(/\s+/g, ' ').slice(0, 400);
+}
+
+function canDescribe(url) {
+  if (!/^https?:\/\//i.test(url || '')) return false;   // chrome://, chrome-extension://, file://, data:, about:
+  try {
+    const u = new URL(url);
+    if (u.hostname === 'chromewebstore.google.com') return false;
+    if (u.hostname === 'chrome.google.com' && u.pathname.startsWith('/webstore')) return false;
+  } catch (e) { return false; }
+  return true;
+}
+
+let descCachePromise = null;
+function loadDescCache() {
+  if (!descCachePromise) {
+    descCachePromise = chrome.storage.session.get('descCache')
+      .then(({ descCache = {} }) => new Map(Object.entries(descCache)))
+      .catch(() => new Map());
+  }
+  return descCachePromise;
+}
+
+let descSaveTimer = null;
+function saveDescCacheSoon(cache) {
+  clearTimeout(descSaveTimer);
+  descSaveTimer = setTimeout(() => {
+    while (cache.size > DESC_CACHE_MAX) cache.delete(cache.keys().next().value);   // oldest first
+    chrome.storage.session.set({ descCache: Object.fromEntries(cache) }).catch(() => {});
+  }, 2000);
+}
+
+const descInFlight = new Set();
+const descFailedAt = new Map();   // url -> time of last failed attempt
+
+async function describeTab(tab, { force = false } = {}) {
+  const url = tab?.url;
+  if (!canDescribe(url) || tab.discarded || tab.status !== 'complete' || descInFlight.has(url)) return;
+  const cache = await loadDescCache();
+  if (!force && cache.has(url)) return;
+  if (!force && Date.now() - (descFailedAt.get(url) || 0) < DESC_RETRY_MS) return;
+  descInFlight.add(url);
+  try {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageDescription });
+    const d = typeof res?.result === 'string' ? res.result.slice(0, DESC_MAX) : '';
+    const before = cache.get(url);
+    cache.delete(url);
+    cache.set(url, d);   // '' = page has no description; the server may try its own fetch
+    saveDescCacheSoon(cache);
+    if (d !== before) schedulePush();
+  } catch (e) {
+    descFailedAt.set(url, Date.now());   // error page, PDF viewer, no access, tab gone, …
+  } finally {
+    descInFlight.delete(url);
+  }
+}
+
+// Describe every loaded tab we have no description for yet (startup, install, permission grant).
+let describingAll = false;
+async function describeAllTabs() {
+  if (describingAll) return;
+  describingAll = true;
+  try {
+    const cache = await loadDescCache();
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) if (!cache.has(t.url)) await describeTab(t);
+  } catch (e) { /* ignore */ } finally {
+    describingAll = false;
+  }
+}
+
 async function collectState(cfg) {
   const wins = await chrome.windows.getAll({ populate: true, windowTypes: ['normal', 'popup'] });
+  const desc = await loadDescCache();
   return {
     machine: cfg.machine || 'unnamed',
     profile: await getProfile(cfg),
@@ -103,6 +197,7 @@ async function collectState(cfg) {
         favIconUrl: t.favIconUrl || '',
         pinned: t.pinned,
         active: t.active,
+        description: desc.get(t.url || '') || '',
       })),
     })),
   };
@@ -368,6 +463,7 @@ function ensureLoop() {
 async function setup() {
   await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
   ensureLoop();
+  describeAllTabs();
 }
 
 chrome.runtime.onInstalled.addListener(async (details) => {
@@ -383,8 +479,11 @@ for (const ev of [chrome.tabs.onCreated, chrome.tabs.onRemoved, chrome.tabs.onMo
   chrome.windows.onCreated, chrome.windows.onRemoved]) {
   ev.addListener(() => { schedulePush(); ensureLoop(); });
 }
-chrome.tabs.onUpdated.addListener((tabId, info) => {
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if ('url' in info || 'title' in info || 'favIconUrl' in info || 'pinned' in info || info.status === 'complete') schedulePush();
+  if (info.status === 'complete') describeTab(tab);
+  // Single-page apps change the URL without a new load: give the page a moment to render.
+  else if ('url' in info && tab.status === 'complete') setTimeout(() => chrome.tabs.get(tabId).then((t) => describeTab(t)).catch(() => {}), 1500);
   ensureLoop();
 });
 
@@ -409,3 +508,4 @@ chrome.action.onClicked.addListener(async () => {
 });
 
 ensureLoop();
+describeAllTabs();

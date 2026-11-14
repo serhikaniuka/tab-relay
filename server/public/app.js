@@ -17,6 +17,7 @@ const state = {
   openSnaps: new Set(),
   filter: '',
   dragging: false,
+  view: localStorage.getItem('tabRelayView') === 'tree' ? 'tree' : 'table',
 };
 
 // ---------- helpers ----------
@@ -139,7 +140,8 @@ function refsFromKeys(keys) {
 function matchesFilter(t) {
   if (!state.filter) return true;
   const f = state.filter.toLowerCase();
-  return (t.title || '').toLowerCase().includes(f) || (t.url || '').toLowerCase().includes(f);
+  return (t.title || '').toLowerCase().includes(f) || (t.url || '').toLowerCase().includes(f)
+    || (t.description || '').toLowerCase().includes(f);
 }
 function offlineByUrl() {
   const m = new Map();
@@ -270,9 +272,14 @@ function render() {
   updateSelectionUi();
 }
 
-// A group node; `keys` are the selection keys (in selection set `set`) underneath it.
-function groupNode({ key, cls, content, children, keys, set, actions = [], drag, dropClient }) {
-  const node = el('div', { class: `node ${cls}${state.collapsed.has(key) ? ' collapsed' : ''}` });
+// The live tabs and the archive are built as one model (groups → leaves) that two renderers
+// consume: the table (default) and the original tree. Group: {type:'group', key, cls, set, keys,
+// content, actions, drag, dropClient, children, hidden}. Leaf: {type:'leaf', key, set, cls, tip,
+// fav, url, title, badges, description, archivedAt, actions}.
+const groupNode = (o) => ({ type: 'group', actions: [], ...o });
+const leafNode = (o) => ({ type: 'leaf', ...o });
+
+function groupCheckbox(keys, set) {
   const cb = el('input', { type: 'checkbox' });
   cb.dataset.keys = JSON.stringify(keys);
   cb.dataset.set = set;
@@ -280,33 +287,107 @@ function groupNode({ key, cls, content, children, keys, set, actions = [], drag,
     for (const k of keys) cb.checked ? state.sel[set].add(k) : state.sel[set].delete(k);
     updateSelectionUi();
   });
-  const toggle = () => {
-    node.classList.toggle('collapsed');
-    node.classList.contains('collapsed') ? state.collapsed.add(key) : state.collapsed.delete(key);
-    localStorage.setItem('tabRelayCollapsed', JSON.stringify([...state.collapsed]));
-  };
-  const row = el('div', { class: 'row' }, el('span', { class: 'twisty', onclick: toggle }), cb, content,
-    actions.length ? el('span', { class: 'actions' }, actions) : null);
-  row.querySelector('.label')?.addEventListener('click', toggle);
-  if (drag && keys.length) makeDraggable(row, set, () => keys);
-  if (dropClient) makeDropTarget(row, dropClient);
-  node.append(row, el('div', { class: 'children' }, children));
-  node.dataset.key = key;
-  return node;
+  return cb;
 }
-
-function leafNode({ key, set, cls, content, actions, title }) {
+function leafCheckbox(key, set) {
   const cb = el('input', { type: 'checkbox', 'data-leaf': key, 'data-set': set });
   cb.checked = state.sel[set].has(key);
   cb.addEventListener('change', () => {
     cb.checked ? state.sel[set].add(key) : state.sel[set].delete(key);
     updateSelectionUi();
   });
-  const row = el('div', { class: 'row', title }, el('span', { class: 'twisty' }), cb, content,
-    el('span', { class: 'actions' }, actions));
-  row.querySelector('.label')?.addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
-  makeDraggable(row, set, () => (state.sel[set].has(key) ? [...state.sel[set]] : [key]));
-  return el('div', { class: `node leaf ${cls}` }, row);
+  return cb;
+}
+function toggleCollapsed(key) {
+  state.collapsed.has(key) ? state.collapsed.delete(key) : state.collapsed.add(key);
+  localStorage.setItem('tabRelayCollapsed', JSON.stringify([...state.collapsed]));
+}
+const leafDragKeys = (n) => () => (state.sel[n.set].has(n.key) ? [...state.sel[n.set]] : [n.key]);
+
+// ---- tree renderer ----
+function treeNode(n) {
+  if (n.type === 'leaf') {
+    const cb = leafCheckbox(n.key, n.set);
+    const row = el('div', { class: 'row', title: n.tip }, el('span', { class: 'twisty' }), cb,
+      favicon(n.fav),
+      el('span', { class: 'label title' }, n.title),
+      n.badges,
+      n.archivedAt ? el('span', { class: 'muted small' }, new Date(n.archivedAt).toLocaleTimeString()) : null,
+      urlSpan(n.url),
+      el('span', { class: 'actions' }, n.actions));
+    row.querySelector('.label').addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
+    makeDraggable(row, n.set, leafDragKeys(n));
+    return el('div', { class: `node leaf ${n.cls}` }, row);
+  }
+  const node = el('div', { class: `node ${n.cls}${state.collapsed.has(n.key) ? ' collapsed' : ''}${n.hidden ? ' hidden-by-filter' : ''}` });
+  const toggle = () => { toggleCollapsed(n.key); node.classList.toggle('collapsed'); };
+  const row = el('div', { class: 'row' }, el('span', { class: 'twisty', onclick: toggle }), groupCheckbox(n.keys, n.set), n.content,
+    n.actions.length ? el('span', { class: 'actions' }, n.actions) : null);
+  row.querySelector('.label')?.addEventListener('click', toggle);
+  if (n.drag && n.keys.length) makeDraggable(row, n.set, () => n.keys);
+  if (n.dropClient) makeDropTarget(row, n.dropClient);
+  node.append(row, el('div', { class: 'children' }, n.children.map(treeNode)));
+  node.dataset.key = n.key;
+  return node;
+}
+
+// ---- table renderer ----
+// Long URLs are shortened in the middle; the full URL is in the tooltip.
+function shortUrl(url) {
+  let s = url.replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+  try { s = decodeURI(s); } catch (e) { /* keep encoded */ }
+  if (s.endsWith('/') && s.indexOf('/') === s.length - 1) s = s.slice(0, -1);
+  return s.length > 52 ? `${s.slice(0, 34)}…${s.slice(-16)}` : s;
+}
+function urlCell(url, fav) {
+  const safe = /^(https?|ftp|file):/i.test(url) ? url : null;
+  const text = url ? shortUrl(url) : '—';
+  return el('td', { class: 'c-url', title: url },
+    favicon(fav),
+    safe ? el('a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, text) : el('span', {}, text));
+}
+
+function tableRows(n, depth, cols, out) {
+  if (n.type === 'leaf') {
+    const cb = leafCheckbox(n.key, n.set);
+    const tr = el('tr', { class: `leaf ${n.cls}`, title: n.tip },
+      el('td', { class: 'c-cb' }, cb),
+      urlCell(n.url, n.fav),
+      el('td', { class: 'c-title' }, el('div', { class: 'clamp' }, el('span', { class: 'label' }, n.title), n.badges)),
+      el('td', { class: `c-desc${n.description ? '' : ' none'}`, title: n.description || 'No description known' },
+        el('div', { class: 'clamp' }, n.description || '—'),
+        el('span', { class: 'actions' }, n.actions)),
+      cols === 5 ? el('td', { class: 'c-date' }, n.archivedAt ? new Date(n.archivedAt).toLocaleString() : '') : null);
+    tr.querySelector('.label').addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
+    makeDraggable(tr, n.set, leafDragKeys(n));
+    out.push(tr);
+    return;
+  }
+  if (n.hidden) return;
+  const collapsed = state.collapsed.has(n.key);
+  const toggle = () => { toggleCollapsed(n.key); renderTree(); updateSelectionUi(); };
+  const cell = el('td', { colspan: cols, style: `padding-left:${8 + depth * 18}px` },
+    el('div', { class: 'grp-line' },
+      el('span', { class: 'twisty', onclick: toggle }), groupCheckbox(n.keys, n.set), n.content,
+      n.actions.length ? el('span', { class: 'actions' }, n.actions) : null));
+  const tr = el('tr', { class: `grp lvl-${depth} ${n.cls}${collapsed ? ' collapsed' : ''}`, 'data-key': n.key }, cell);
+  tr.querySelector('.label')?.addEventListener('click', toggle);
+  if (n.drag && n.keys.length) makeDraggable(tr, n.set, () => n.keys);
+  if (n.dropClient) makeDropTarget(tr, n.dropClient);
+  out.push(tr);
+  if (!collapsed) for (const c of n.children) tableRows(c, depth + 1, cols, out);
+}
+
+function tableOf(nodes, { archive = false } = {}) {
+  const cols = archive ? 5 : 4;
+  const rows = [];
+  for (const n of nodes) tableRows(n, 0, cols, rows);
+  return el('table', { class: `tt${archive ? ' archive' : ''}` },
+    el('colgroup', {}, el('col', { class: 'w-cb' }), el('col', { class: 'w-url' }), el('col', { class: 'w-title' }),
+      el('col', { class: 'w-desc' }), archive ? el('col', { class: 'w-date' }) : null),
+    el('thead', {}, el('tr', {}, el('th', {}), el('th', {}, 'URL'), el('th', {}, 'Title'), el('th', {}, 'Description'),
+      archive ? el('th', {}, 'Archived') : null)),
+    el('tbody', {}, rows));
 }
 
 function favicon(url) {
@@ -328,25 +409,29 @@ const CLOSING_TEXT = { move: 'moving…', archive: 'archiving…', delete: 'clos
 function renderTree() {
   const root = $('#tree');
   root.textContent = '';
-  root.append(renderLive(), renderArchive());
+  root.classList.toggle('table-view', state.view === 'table');
+  const live = liveModel();
+  const archive = archiveModel();
+  const empty = live.length ? null : el('div', { class: 'empty muted' },
+    'No clients yet. Install the extension in Chrome, set the server URL and token in its options, and it will appear here.');
+  if (state.view === 'tree') {
+    root.append(empty || '', ...live.map(treeNode), treeNode(archive));
+  } else {
+    root.append(empty || tableOf(live), tableOf([archive], { archive: true }));
+  }
+  $('#btn-view').textContent = state.view === 'tree' ? 'Table view' : 'Tree view';
 }
 
-function renderLive() {
-  const frag = document.createDocumentFragment();
+function liveModel() {
   const clients = state.tree?.clients || [];
-  if (!clients.length) {
-    frag.append(el('div', { class: 'empty muted' },
-      'No clients yet. Install the extension in Chrome, set the server URL and token in its options, and it will appear here.'));
-    return frag;
-  }
-  const now = state.tree.now;
+  const now = state.tree?.now;
   const offMap = offlineByUrl();
   const machines = new Map();
   for (const c of clients) {
     if (!machines.has(c.machine)) machines.set(c.machine, []);
     machines.get(c.machine).push(c);
   }
-
+  const out = [];
   for (const [machine, mclients] of machines) {
     const mKeys = [];
     const profileNodes = mclients.map((c) => {
@@ -355,8 +440,9 @@ function renderLive() {
         const tabs = w.tabs.filter(matchesFilter);
         const wKeys = tabs.map((t) => `${c.id}:${t.id}`);
         pKeys.push(...wKeys);
-        const n = groupNode({
+        return groupNode({
           key: `w:${c.id}:${w.id}`, cls: 'window', set: 'live', keys: wKeys, drag: true,
+          hidden: !tabs.length && !!state.filter,
           content: [
             el('span', { class: 'label' }, `Window ${wi + 1}`),
             el('span', { class: 'badge' }, plural(tabs.length, 'tab')),
@@ -366,8 +452,6 @@ function renderLive() {
           children: tabs.map((t) => liveTab(c, t, offMap.get(t.url))),
           actions: liveActions(wKeys),
         });
-        if (!tabs.length && state.filter) n.classList.add('hidden-by-filter');
-        return n;
       });
       mKeys.push(...pKeys);
       const tabCount = c.windows.reduce((n, w) => n + w.tabs.length, 0);
@@ -388,7 +472,7 @@ function renderLive() {
       });
     });
     const anyOnline = mclients.some((c) => c.online);
-    frag.append(groupNode({
+    out.push(groupNode({
       key: `m:${machine}`, cls: 'machine', set: 'live', keys: mKeys, drag: true,
       // A machine with a single profile is also a drop target for that profile.
       dropClient: mclients.length === 1 ? mclients[0].id : null,
@@ -401,28 +485,26 @@ function renderLive() {
       actions: liveActions(mKeys),
     }));
   }
-  return frag;
+  return out;
 }
 
 function liveTab(c, t, off) {
   const key = `${c.id}:${t.id}`;
   return leafNode({
     key, set: 'live', cls: `tab${t.active ? ' active' : ''}${t.closing ? ' closing' : ''}`,
-    title: `${t.title}\n${t.url}\nfrom ${clientName(c)}`,
-    content: [
-      favicon(t.favIconUrl),
-      el('span', { class: 'label title' }, t.title || t.url || '(untitled)'),
+    tip: `${t.title}\n${t.url}${t.description ? `\n\n${t.description}` : ''}\n\nfrom ${clientName(c)}`,
+    fav: t.favIconUrl, url: t.url, title: t.title || t.url || '(untitled)', description: t.description,
+    badges: [
       t.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       t.closing ? el('span', { class: 'badge warn' }, CLOSING_TEXT[t.closing] || 'closing…') : null,
       off ? offlineBadge(off) : null,
-      urlSpan(t.url),
     ],
     actions: liveActions([key]),
   });
 }
 
 // Archive: machine -> profile -> date -> items
-function renderArchive() {
+function archiveModel() {
   const items = state.archive.filter(matchesFilter);
   const tree = new Map();
   for (const a of items) {
@@ -483,15 +565,12 @@ function archiveTab(a) {
   const key = String(a.id);
   return leafNode({
     key, set: 'archive', cls: 'tab archived',
-    title: `${a.title}\n${a.url}\nfrom ${a.source.machine} — ${profileText(a.source.email, a.source.label)}\narchived ${new Date(a.archivedAt).toLocaleString()}`,
-    content: [
-      favicon(a.favIconUrl),
-      el('span', { class: 'label title' }, a.title || a.url || '(untitled)'),
+    tip: `${a.title}\n${a.url}${a.description ? `\n\n${a.description}` : ''}\n\nfrom ${a.source.machine} — ${profileText(a.source.email, a.source.label)}\narchived ${new Date(a.archivedAt).toLocaleString()}`,
+    fav: a.favIconUrl, url: a.url, title: a.title || a.url || '(untitled)', description: a.description, archivedAt: a.archivedAt,
+    badges: [
       a.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       a.offline ? offlineBadge(a.offline) : null,
       a.offline ? el('a', { class: 'badge', href: offlineUrl(a.offline.id, 'download'), title: 'Download .mhtml' }, '⬇') : null,
-      el('span', { class: 'muted small' }, new Date(a.archivedAt).toLocaleTimeString()),
-      urlSpan(a.url),
     ],
     actions: archiveActions([key]),
   });
@@ -648,12 +727,21 @@ $('#btn-expand').addEventListener('click', () => {
   renderTree(); updateSelectionUi();
 });
 $('#btn-collapse').addEventListener('click', () => {
-  for (const n of document.querySelectorAll('#tree .node:not(.leaf)')) {
+  for (const n of document.querySelectorAll('#tree .node:not(.leaf), #tree tr.grp')) {
     if (!n.classList.contains('machine') && !n.classList.contains('archive-root')) state.collapsed.add(n.dataset.key);
   }
   localStorage.setItem('tabRelayCollapsed', JSON.stringify([...state.collapsed]));
   renderTree(); updateSelectionUi();
 });
+
+$('#btn-view').addEventListener('click', () => {
+  state.view = state.view === 'tree' ? 'table' : 'tree';
+  localStorage.setItem('tabRelayView', state.view);
+  renderTree(); updateSelectionUi();
+});
+
+// Keep the sticky table header just below the (variable-height) sticky toolbar.
+new ResizeObserver(() => document.documentElement.style.setProperty('--toolbar-h', `${$('#toolbar').offsetHeight}px`)).observe($('#toolbar'));
 
 // ---------- boot ----------
 if (state.token) {
