@@ -162,56 +162,141 @@ const target = () => $('#target').value;
 const targetLabel = (id = target()) => { const c = clientById(id); return c ? clientName(c) : '?'; };
 const newWindow = () => $('#new-window').checked;
 
-async function run(fn, okText, clear) {
+// Runs an action, reports success/failure, deselects the affected keys (not the whole
+// selection, so a per-row action keeps the user's other checkboxes) and refreshes.
+// Resolves to true on success.
+async function run(fn, okText, set, keys) {
   try {
     await fn();
     flash(okText);
-    if (clear) clear.clear();
+    if (set) for (const k of keys) set.delete(k);
     await refresh();
-  } catch (e) { flash(e.message, true); }
+    return true;
+  } catch (e) {
+    flash(e.message, true);
+    return false;
+  }
+}
+
+// "3 tabs" for bulk actions, the tab's title for a single row.
+function whatTabs(keys, noun = 'tab') {
+  if (keys.length !== 1) return plural(keys.length, noun);
+  let title = '';
+  if (noun === 'tab') {
+    const i = keys[0].lastIndexOf(':');
+    const c = clientById(keys[0].slice(0, i));
+    const id = Number(keys[0].slice(i + 1));
+    for (const w of c?.windows || []) for (const t of w.tabs) if (t.id === id) title = t.title || t.url;
+  } else {
+    const a = state.archive.find((x) => String(x.id) === keys[0]);
+    title = a ? a.title || a.url : '';
+  }
+  return title ? `"${title.length > 60 ? `${title.slice(0, 57)}…` : title}"` : plural(1, noun);
 }
 
 const act = {
   open(keys, to = target()) {
     if (!to) return flash('Choose a target first', true);
     return run(() => api('POST', '/api/actions/open', { tabs: refsFromKeys(keys), targetClientId: to, newWindow: newWindow() }),
-      `Opening ${plural(keys.length, 'tab')} on ${targetLabel(to)}`, state.sel.live);
+      `Opening ${whatTabs(keys)} on ${targetLabel(to)}`, state.sel.live, keys);
   },
   move(keys, to = target()) {
     if (!to) return flash('Choose a target first', true);
     return run(() => api('POST', '/api/actions/move', { tabs: refsFromKeys(keys), targetClientId: to, newWindow: newWindow() }),
-      `Moving ${plural(keys.length, 'tab')} to ${targetLabel(to)} (sources close once they are open)`, state.sel.live);
+      `Moving ${whatTabs(keys)} to ${targetLabel(to)} (sources close once they are open)`, state.sel.live, keys);
   },
   archive(keys, offline = false) {
     return run(() => api('POST', '/api/actions/archive', { tabs: refsFromKeys(keys), offline }),
-      `Archiving ${plural(keys.length, 'tab')}${offline ? ' (saving offline copies first)' : ''}`, state.sel.live);
+      `Archiving ${whatTabs(keys)}${offline ? ' (saving offline copies first)' : ''}`, state.sel.live, keys);
   },
   offline(keys) {
     return run(() => api('POST', '/api/actions/offline', { tabs: refsFromKeys(keys) }),
-      `Saving ${plural(keys.length, 'tab')} for offline reading`, state.sel.live);
+      `Saving ${whatTabs(keys)} for offline reading`, state.sel.live, keys);
   },
   del(keys) {
-    if (!confirm(`Close and remove ${plural(keys.length, 'tab')}? They will NOT be archived.`)) return;
+    if (!confirm(`Close and remove ${whatTabs(keys)}? ${keys.length === 1 ? 'It' : 'They'} will NOT be archived.`)) return;
     return run(() => api('POST', '/api/actions/close', { tabs: refsFromKeys(keys) }),
-      `Closing ${plural(keys.length, 'tab')}`, state.sel.live);
+      `Closing ${whatTabs(keys)}`, state.sel.live, keys);
   },
   snapshot(keys) {
     const name = prompt('Snapshot name:', `Snapshot ${new Date().toLocaleString()}`);
     if (name === null) return;
     return run(() => api('POST', '/api/snapshots', { tabs: refsFromKeys(keys), name }),
-      `Saved snapshot "${name}" (${plural(keys.length, 'tab')})`, state.sel.live);
+      `Saved snapshot "${name}" (${plural(keys.length, 'tab')})`, state.sel.live, keys);
   },
   restore(ids, to = target()) {
     if (!to) return flash('Choose a target first', true);
     return run(() => api('POST', '/api/archive/restore', { ids: ids.map(Number), targetClientId: to, newWindow: true }),
-      `Restoring ${plural(ids.length, 'archived tab')} on ${targetLabel(to)}`, state.sel.archive);
+      `Restoring ${whatTabs(ids, 'archived tab')} on ${targetLabel(to)}`, state.sel.archive, ids);
   },
   purge(ids) {
-    if (!confirm(`Permanently delete ${plural(ids.length, 'archived tab')} (and their offline copies)?`)) return;
+    if (!confirm(`Permanently delete ${whatTabs(ids, 'archived tab')} (and ${ids.length === 1 ? 'its offline copy' : 'their offline copies'})?`)) return;
     return run(() => api('POST', '/api/archive/delete', { ids: ids.map(Number) }),
-      `Deleted ${plural(ids.length, 'archived tab')}`, state.sel.archive);
+      `Deleted ${whatTabs(ids, 'archived tab')}`, state.sel.archive, ids);
   },
 };
+
+// ---------- per-row buttons (table view) ----------
+// Feather-style line icons (static markup).
+const ICONS = {
+  trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  save: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+  saved: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 9 10.5 12.5 17 6"/>',
+  archive: '<polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/>',
+  restore: '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>',
+  spinner: '<path d="M12 2a10 10 0 1 0 10 10" />',
+};
+function icon(name) {
+  const span = document.createElement('span');
+  span.className = 'ico';
+  span.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+  return span;
+}
+
+// A compact icon button; while its action runs it shows a spinner and is disabled.
+function rowButton({ name, ico, title, cls = '', disabled = false, onclick }) {
+  const b = el('button', { type: 'button', class: `rb ${cls}`, title, 'aria-label': title, 'data-action': name, disabled }, icon(ico));
+  b.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (b.disabled) return;
+    b.disabled = true;
+    b.classList.add('busy');
+    b.replaceChildren(icon('spinner'));
+    try { await onclick(); } finally {
+      // The table is usually re-rendered by the refresh; restore the button if it wasn't.
+      if (b.isConnected) { b.disabled = false; b.classList.remove('busy'); b.replaceChildren(icon(ico)); }
+    }
+  });
+  return b;
+}
+
+const canCapture = (url) => /^https?:\/\//i.test(url || '') && !/^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)/i.test(url);
+
+function liveRowButtons(key, t, off) {
+  const busy = !!t.closing;   // already being moved / archived / closed
+  let save;
+  if (t.capturing) {
+    save = { ico: 'spinner', cls: 'busy', disabled: true, title: 'Saving an offline copy…' };
+  } else if (!canCapture(t.url)) {
+    save = { ico: 'save', disabled: true, title: "Save offline: not possible for this page (only http/https pages can be captured)" };
+  } else if (off) {
+    save = { ico: 'saved', cls: 'done', title: `Saved offline (${bytes(off.size)}, ${new Date(off.createdAt).toLocaleString()}). Click to save a fresh copy` };
+  } else {
+    save = { ico: 'save', title: 'Save offline' };
+  }
+  return [
+    rowButton({ name: 'delete', ico: 'trash', cls: 'danger', disabled: busy, title: 'Delete (close the tab, no archive)', onclick: () => act.del([key]) }),
+    rowButton({ name: 'offline', ...save, disabled: save.disabled || busy, onclick: () => act.offline([key]) }),
+    rowButton({ name: 'archive', ico: 'archive', disabled: busy, title: 'Archive (close the tab, keep it in the Archive)', onclick: () => act.archive([key]) }),
+  ];
+}
+
+function archiveRowButtons(key) {
+  return [
+    rowButton({ name: 'purge', ico: 'trash', cls: 'danger', title: 'Delete permanently (with its offline copy)', onclick: () => act.purge([key]) }),
+    rowButton({ name: 'restore', ico: 'restore', title: 'Restore (open on the target client, remove from the Archive)', onclick: () => act.restore([key]) }),
+  ];
+}
 
 // Hover buttons for a live node / archive node.
 function liveActions(keys) {
@@ -362,18 +447,19 @@ const INDENT = 20;
 const TWISTY = 22;   // twisty width + gap in group rows
 const leafPad = (depth) => PAD + depth * INDENT + (depth ? TWISTY : 0);
 
-function tableRows(n, depth, cols, out, flat) {
+function tableRows(n, depth, cols, out, flat, archive = false) {
   if (n.type === 'leaf') {
     const cb = leafCheckbox(n.key, n.set);
-    const tr = el('tr', { class: `leaf ${n.cls}`, title: n.tip },
+    const tr = el('tr', { class: `leaf ${n.cls}`, title: n.tip, 'data-key': n.key },
       el('td', { class: 'c-cb', style: `padding-left:${leafPad(depth)}px` }, cb),
+      el('td', { class: 'c-act' }, el('div', { class: 'row-btns' }, n.rowActions)),
       urlCell(n.url, n.fav),
       el('td', { class: 'c-title' }, el('div', { class: 'clamp' }, el('span', { class: 'label' }, n.title), n.badges,
         flat && n.src ? el('span', { class: 'badge src', title: `from ${n.src}` }, n.src) : null)),
       el('td', { class: `c-desc${n.description ? '' : ' none'}`, title: n.description || 'No description known' },
         el('div', { class: 'clamp' }, n.description || '—'),
-        el('span', { class: 'actions' }, n.actions)),
-      cols === 5 ? el('td', { class: 'c-date' }, n.archivedAt ? new Date(n.archivedAt).toLocaleString() : '') : null);
+        n.hoverActions?.length ? el('span', { class: 'actions' }, n.hoverActions) : null),
+      archive ? el('td', { class: 'c-date' }, n.archivedAt ? new Date(n.archivedAt).toLocaleString() : '') : null);
     tr.querySelector('.label').addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
     makeDraggable(tr, n.set, leafDragKeys(n));
     out.push(tr);
@@ -391,7 +477,7 @@ function tableRows(n, depth, cols, out, flat) {
   if (n.drag && n.keys.length) makeDraggable(tr, n.set, () => n.keys);
   if (n.dropClient) makeDropTarget(tr, n.dropClient);
   out.push(tr);
-  if (!collapsed) for (const c of n.children) tableRows(c, depth + 1, cols, out, flat);
+  if (!collapsed) for (const c of n.children) tableRows(c, depth + 1, cols, out, flat, archive);
 }
 
 // ---- sorting ----
@@ -451,12 +537,12 @@ function collectLeaves(nodes, out = []) {
 }
 
 function tableOf(nodes, { archive = false, flat = false } = {}) {
-  const cols = archive ? 5 : 4;
+  const cols = archive ? 6 : 5;
   const rows = [];
   if (flat) {
-    for (const leaf of sortLeaves(collectLeaves(nodes))) tableRows(leaf, 0, cols, rows, true);
+    for (const leaf of sortLeaves(collectLeaves(nodes))) tableRows(leaf, 0, cols, rows, true, archive);
   } else {
-    for (const n of nodes) tableRows(n, 0, cols, rows, false);
+    for (const n of nodes) tableRows(n, 0, cols, rows, false, archive);
   }
   const leafDepth = flat ? 0 : archive ? 4 : 3;
   const allKeys = collectLeaves(nodes).map((l) => l.key);
@@ -467,11 +553,13 @@ function tableOf(nodes, { archive = false, flat = false } = {}) {
   return el('table', { class: `tt${archive ? ' archive' : ''}${flat ? ' flat' : ''}` },
     el('colgroup', {},
       el('col', { class: 'w-cb', style: `width:${leafPad(leafDepth) + 16 + PAD}px` }),
+      el('col', { class: `w-act${archive ? ' two' : ''}` }),
       el('col', { class: 'w-url' }), el('col', { class: 'w-title' }), el('col', { class: 'w-desc' }),
       archive ? el('col', { class: 'w-date' }) : null),
     el('thead', {}, el('tr', {},
       el('th', { class: 'c-cb', style: `padding-left:${leafPad(leafDepth)}px`, title: `Select all ${archive ? 'archived' : 'live'} tabs in this table` },
         allKeys.length ? groupCheckbox(allKeys, set) : null),
+      el('th', { class: 'c-act', title: archive ? 'Row actions: Delete permanently, Restore' : 'Row actions: Delete, Save offline, Archive' }),
       sortHeader('url'), sortHeader('title'), sortHeader('desc'),
       archive ? sortHeader('date', 'c-date') : null)),
     el('tbody', {}, rows));
@@ -600,9 +688,16 @@ function liveTab(c, t, off) {
     tip: `${t.title}\n${t.url}${t.description ? `\n\n${t.description}` : ''}\n\nfrom ${clientName(c)}`,
     fav: t.favIconUrl, url: t.url, title: t.title || t.url || '(untitled)', description: t.description,
     sortTitle: t.title, src: clientName(c),
+    rowActions: liveRowButtons(key, t, off),
+    // In the table, Delete / Save offline / Archive are row buttons; the hover menu keeps the rest.
+    hoverActions: [
+      el('button', { class: 'mini', title: 'Move to the target client', onclick: () => act.move([key]) }, 'Move'),
+      el('button', { class: 'mini', title: 'Archive and save an offline copy', onclick: () => act.archive([key], true) }, 'Archive+offline'),
+    ],
     badges: [
       t.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       t.closing ? el('span', { class: 'badge warn' }, CLOSING_TEXT[t.closing] || 'closing…') : null,
+      t.capturing ? el('span', { class: 'badge warn' }, 'saving offline…') : null,
       off ? offlineBadge(off) : null,
     ],
     actions: liveActions([key]),
@@ -674,6 +769,8 @@ function archiveTab(a) {
     tip: `${a.title}\n${a.url}${a.description ? `\n\n${a.description}` : ''}\n\nfrom ${a.source.machine} — ${profileText(a.source.email, a.source.label)}\narchived ${new Date(a.archivedAt).toLocaleString()}`,
     fav: a.favIconUrl, url: a.url, title: a.title || a.url || '(untitled)', description: a.description, archivedAt: a.archivedAt,
     sortTitle: a.title, src: `${a.source.machine} — ${profileText(a.source.email, a.source.label)}`,
+    rowActions: archiveRowButtons(key),
+    hoverActions: [],
     badges: [
       a.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       a.offline ? offlineBadge(a.offline) : null,

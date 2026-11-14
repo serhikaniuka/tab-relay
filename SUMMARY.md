@@ -190,3 +190,32 @@ Data locations (all git-ignored):
 - **Tests:** all 33 server tests pass (unchanged).
   - The e2e now also checks: the flat list has no group rows and shows 2 drop chips; URL ascending/descending matches the expected host-then-URL order; the ▲/▼ indicator; the choice survives a page reload; the third click restores the original order; title sort within each window keeps the groups; turning sorting off restores the grouped browser order.
   - The whole e2e passes, including all earlier steps.
+
+## Phase 6: per-row action buttons
+
+- **New column:** every table row has compact icon buttons right after its checkbox, before the URL. They act on that one tab, through the same endpoints as the bulk toolbar actions (no new API).
+  - Live tabs:
+    - **Delete** (trash) → `/api/actions/close`, after a confirmation naming the tab;
+    - **Save offline** (download) → `/api/actions/offline`;
+    - **Archive** (box) → `/api/actions/archive`.
+  - Archived tabs:
+    - **Delete permanently** → `/api/archive/delete`, with a confirmation;
+    - **Restore** to the Target client → `/api/archive/restore`.
+  - Archived rows have no Archive button, and no Save offline because the tab is already closed.
+- **Feedback:**
+  - Each button has a tooltip and shows a spinner while its request runs.
+  - A message names the tab ("Archiving "Page four"") or shows the error, and the table refreshes.
+  - Rows being moved, archived or closed get their buttons disabled, next to the existing *archiving…* / *closing…* badges.
+- **Save offline states:**
+  - A spinner and a *saving offline…* badge while a capture is pending. To support this, `/api/tree` now marks such tabs `capturing: true`; it's an extra field on an existing endpoint.
+  - A green ✓ "saved" icon once a copy for that URL exists, with size and date in the tooltip. Clicking it saves a fresh copy, the same as the bulk Save offline, which also allows re-saving.
+  - Disabled for pages that can't be captured (non-http(s), Web Store).
+- **Selection:** per-row actions, and the existing hover actions, now deselect only the affected tabs. Before, any action cleared the whole selection. Bulk toolbar actions are unchanged.
+- **Hover menu:** in the table, it keeps Move and Archive+offline (Delete/Offline/Archive moved into the row buttons). The tree view is unchanged.
+- **Layout:** the buttons work in grouped and flat-list modes, in a fixed-width column (3 buttons for live tabs, 2 for archived ones). The archive table got narrower URL/Title columns so Description stays readable.
+- **Tests:**
+  - All 33 server tests pass; the save-offline test now also checks the `capturing` flag.
+  - The e2e has a new row-button step: Save offline (→ ✓ "saved"), Archive, Restore and Delete permanently from the archive row, Delete with cancel and then confirm, another row's checkbox kept, Save offline disabled on `about:blank`, and 3 buttons per row in flat mode.
+  - The earlier e2e column check now uses the cell classes, and also asserts the column order: checkbox | buttons | URL | Title | Description.
+  - The full e2e passes.
+- **What you need to do:** the server was restarted (for the `capturing` flag). **Just refresh the web UI page.** The extension is unchanged, so there's no need to reload it.

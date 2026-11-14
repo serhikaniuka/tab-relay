@@ -98,10 +98,12 @@ async function browser(name) {
     await ui.waitForSelector('table.tt:not(.archive) tr.leaf');
     // The table shows URL, title and description columns.
     const row1 = ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page one' }).first();
-    const cells = await row1.locator('td').allInnerTexts();
-    if (!cells[1].includes('127.0.0.1:8798/one') || !cells[2].includes('Page one') || !cells[3].includes('Description of page one'))
+    const cells = await Promise.all(['td.c-url', 'td.c-title', 'td.c-desc'].map((c) => row1.locator(c).innerText()));
+    if (!cells[0].includes('127.0.0.1:8798/one') || !cells[1].includes('Page one') || !cells[2].includes('Description of page one'))
       throw new Error('table cells: ' + JSON.stringify(cells));
-    step(`table row: ${JSON.stringify(cells.slice(1, 4).map((c) => c.split('\n')[0]))}`);
+    const order = await row1.locator('td').evaluateAll((tds) => tds.map((td) => td.className.split(' ')[0]));
+    if (JSON.stringify(order) !== '["c-cb","c-act","c-url","c-title","c-desc"]') throw new Error('column order: ' + order);
+    step(`table row: ${JSON.stringify(cells.map((c) => c.split('\n')[0]))}, columns ${order.join(' | ')}`);
     await ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page three' }).first()
       .dragTo(ui.locator('table.tt:not(.archive) tr.grp.profile', { hasText: 'beta-prof' }));
     await until(async () => (await tabsOf('beta')).some((t) => t.url === `${SITE}/three`), 'moved tab opened on beta');
@@ -201,6 +203,72 @@ async function browser(name) {
     await until(async () => !(await tab('two')), 'deleted tab closed');
     if ((await api('GET', '/api/archive')).items.length) throw new Error('delete must not archive');
     step('delete closes the tab without archiving');
+
+    // 7b. Per-row buttons: Save offline / Archive / Delete on live rows; Restore / Delete on archived rows.
+    {
+      const LIVE = 'table.tt:not(.archive)';
+      if (!site.listening) await new Promise((r) => site.listen(SITE_PORT, '127.0.0.1', r));   // step 5 took it down
+      for (const p of ['four', 'five']) await (await A.newPage()).goto(`${SITE}/${p}`);
+      await until(async () => (await tab('four')) && (await tab('five')), 'pages four/five pushed');
+      await ui.reload();
+      const row = (title) => ui.locator(`${LIVE} tr.leaf`, { hasText: title }).first();
+      await row('Page four').waitFor();
+      const btn = (title, action) => row(title).locator(`button[data-action="${action}"]`);
+      // Another row stays selected through per-row actions.
+      await row('Page five').locator('input[type=checkbox]').check();
+      if ((await ui.textContent('#sel-count')).trim() !== '1 tab selected') throw new Error('selection');
+      // Non-http tabs can't be captured: their Save offline button is disabled.
+      const blank = ui.locator(`${LIVE} tr.leaf`, { hasText: 'about:blank' }).first();
+      if (await blank.count() && !(await blank.locator('button[data-action="offline"]').isDisabled())) throw new Error('about:blank save offline should be disabled');
+
+      await btn('Page four', 'offline').click();
+      await ui.locator('#msg div', { hasText: 'Saving "Page four" for offline reading' }).first().waitFor();
+      await until(async () => (await api('GET', '/api/offline')).items.find((o) => o.url === `${SITE}/four`), 'row save offline');
+      await until(async () => (await btn('Page four', 'offline').getAttribute('class')).includes('done'), 'save button shows "saved"', 10000);
+      if (!(await btn('Page four', 'offline').getAttribute('title')).startsWith('Saved offline')) throw new Error('saved tooltip');
+
+      await btn('Page four', 'archive').click();
+      await ui.locator('#msg div', { hasText: 'Archiving "Page four"' }).first().waitFor();
+      await until(async () => !(await tab('four')) && (await api('GET', '/api/archive')).items.some((a) => a.url === `${SITE}/four`), 'row archive');
+      const arow = () => ui.locator('table.tt.archive tr.leaf', { hasText: 'Page four' }).first();
+      await arow().waitFor();
+      const aActions = await arow().locator('button.rb').evaluateAll((bs) => bs.map((b) => b.dataset.action));
+      if (JSON.stringify(aActions) !== '["purge","restore"]') throw new Error('archive row buttons: ' + aActions);
+
+      await ui.selectOption('#target', alpha.id);
+      await arow().locator('button[data-action="restore"]').click();
+      await until(async () => (await tab('four')) && !(await api('GET', '/api/archive')).items.some((a) => a.url === `${SITE}/four`), 'row restore');
+
+      await ui.reload();
+      await row('Page four').waitFor();
+      await btn('Page four', 'archive').click();
+      await until(async () => (await api('GET', '/api/archive')).items.some((a) => a.url === `${SITE}/four`), 'archived again');
+      await arow().waitFor();
+      ui.once('dialog', (d) => d.accept());
+      await arow().locator('button[data-action="purge"]').click();
+      await until(async () => !(await api('GET', '/api/archive')).items.some((a) => a.url === `${SITE}/four`), 'row purge');
+
+      // Delete asks for confirmation; dismissing it does nothing.
+      ui.once('dialog', (d) => d.dismiss());
+      await btn('Page five', 'delete').click();
+      await sleep(1500);
+      if (!(await tab('five'))) throw new Error('dismissed delete must not close the tab');
+      ui.once('dialog', (d) => d.accept());
+      await btn('Page five', 'delete').click();
+      await until(async () => !(await tab('five')), 'row delete');
+      if ((await api('GET', '/api/archive')).items.some((a) => a.url === `${SITE}/five`)) throw new Error('delete must not archive');
+
+      // Flat list: every live row has its three buttons too.
+      await ui.check('#flat');
+      await ui.waitForSelector(`${LIVE}.flat tr.leaf`);
+      const nRows = await ui.locator(`${LIVE}.flat tr.leaf`).count();
+      const nBtns = await ui.locator(`${LIVE}.flat tr.leaf button.rb`).count();
+      await ui.screenshot({ path: path.join(WORK, 'ui-row-buttons-flat.png'), fullPage: true });
+      await ui.uncheck('#flat');
+      if (nBtns !== nRows * 3) throw new Error(`flat: ${nBtns} buttons for ${nRows} rows`);
+      await ui.screenshot({ path: path.join(WORK, 'ui-row-buttons.png'), fullPage: true });
+      step(`row buttons: save offline (→ "saved"), archive, restore, purge, delete with confirm; selection kept; flat list ${nRows} rows × 3 buttons`);
+    }
 
     // 8. Remove a stale (offline) client from the UI
     await api('POST', '/api/clients/ghost-client/state', { machine: 'ghost', profile: { label: 'stale' }, windows: [{ id: 1, tabs: [{ id: 1, url: 'https://ghost/' }] }] });

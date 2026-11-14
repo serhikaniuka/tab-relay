@@ -141,6 +141,8 @@ function createApp({
     ackCommand: db.prepare('UPDATE commands SET status=?, acked_at=?, result=? WHERE id=?'),
     cancelDependents: db.prepare(`UPDATE commands SET status='cancelled', acked_at=?, result=?
       WHERE depends_on = ? AND dep_mode = 'success' AND status IN ('pending','delivered')`),
+    openCaptures: db.prepare(`SELECT client_id, payload FROM commands
+      WHERE type = 'capture' AND status IN ('pending','delivered')`),
     openCloses: db.prepare(`SELECT client_id, payload FROM commands
       WHERE type = 'close' AND status IN ('pending','delivered')`),
     recentCommands: db.prepare(`SELECT c.*, cl.machine, cl.profile_email, cl.profile_label
@@ -495,12 +497,17 @@ function createApp({
   // ---------- UI endpoints ----------
 
   // Tree: clients -> windows -> tabs. Grouping by machine/profile is done by the UI.
-  // Tabs with an outstanding close command carry `closing: <reason>`.
+  // Tabs with an outstanding close command carry `closing: <reason>`; with an outstanding
+  // offline capture, `capturing: true`.
   app.get('/api/tree', (req, res) => {
     const closing = new Map();
     for (const c of st.openCloses.all()) {
       const p = JSON.parse(c.payload);
       for (const id of p.tabIds || []) closing.set(`${c.client_id}:${id}`, p.reason || 'close');
+    }
+    const capturing = new Set();
+    for (const c of st.openCaptures.all()) {
+      for (const id of JSON.parse(c.payload).tabIds || []) capturing.add(`${c.client_id}:${id}`);
     }
     const clients = st.allClients.all().map((c) => ({ ...clientView(c), windows: [] }));
     const byId = new Map(clients.map((c) => [c.id, c]));
@@ -518,6 +525,7 @@ function createApp({
       const v = tabView(t);
       const reason = closing.get(`${t.client_id}:${t.tab_id}`);
       if (reason) v.closing = reason;
+      if (capturing.has(`${t.client_id}:${t.tab_id}`)) v.capturing = true;
       w.tabs.push(v);
     }
     res.json({ now: now(), onlineMs: ONLINE_MS, clients });

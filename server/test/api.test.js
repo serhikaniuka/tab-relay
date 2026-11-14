@@ -428,10 +428,16 @@ test('save offline action, size limit, and deleting copies', async () => {
   assert.deepEqual([cap.type, cap.payload.tabIds], ['capture', [100]]);
 
   // Without URL headers the server falls back to the stored tab's url/title.
+  // Until the capture is acked, the tree marks the tab as capturing (per-row "saving…" state).
+  let macTabs = (await api('GET', '/api/tree')).body.clients.find((c) => c.id === 'mac-1').windows[0].tabs;
+  assert.equal(macTabs.find((t) => t.id === 100).capturing, true);
+  assert.equal(macTabs.find((t) => t.id === 101).capturing, undefined);
   const up = await upload('mac-1', { tabId: 100, commandId: cap.id });
   assert.equal(up.status, 201);
   await api('POST', `/api/commands/${cap.id}/ack`, { ok: true });
   await drain('dev-1');
+  macTabs = (await api('GET', '/api/tree')).body.clients.find((c) => c.id === 'mac-1').windows[0].tabs;
+  assert.equal(macTabs.find((t) => t.id === 100).capturing, undefined, 'cleared once the capture is acked');
   let off = (await api('GET', '/api/offline')).body;
   const copy = off.items.find((o) => o.id === up.body.id);
   assert.equal(copy.url, 'https://example.com/a');

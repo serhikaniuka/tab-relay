@@ -173,3 +173,30 @@ table.tt tr.drop-over td { background: var(--hover) !important; outline: 2px sol
 body.dragging .drop-strip .chip.drop-target { border: 1px dashed var(--accent); }
 .drop-strip .chip.drop-over { background: var(--hover); border: 2px solid var(--accent); }
 #flat-label[hidden] { display: none; }
+
+/* ---------- per-row action buttons (phase 6) ---------- */
+table.tt col.w-act { width: 116px; }
+table.tt col.w-act.two { width: 84px; }
+table.tt td.c-act { padding-left: 6px; padding-right: 6px; }
+table.tt .row-btns { display: flex; gap: 6px; align-items: center; }
+button.rb {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 26px; padding: 0; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+}
+button.rb .ico { display: inline-flex; }
+button.rb:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); background: var(--hover); }
+button.rb.danger { color: var(--muted); }
+button.rb.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); background: #fdecea; }
+button.rb.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+button.rb.done:hover:not(:disabled) { color: var(--ok); border-color: var(--ok); }
+button.rb:disabled { opacity: .35; cursor: not-allowed; }
+button.rb.busy { opacity: .8; cursor: progress; color: var(--accent); }
+button.rb.busy svg { animation: rb-spin .8s linear infinite; }
+@keyframes rb-spin { to { transform: rotate(360deg); } }
+@media (prefers-color-scheme: dark) { button.rb.danger:hover:not(:disabled) { background: #3a1f1f; } }
+/* The archive table has two more fixed columns (row buttons, Archived) and deeper indentation:
+   narrower URL/Title so Description keeps a readable width. */
+table.tt.archive col.w-url { width: 21%; }
+table.tt.archive col.w-title { width: 22%; }
+table.tt.archive col.w-date { width: 150px; }

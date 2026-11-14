@@ -97,6 +97,12 @@ Click the extension's toolbar icon to open the web UI. The token is passed in th
 Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localStorage).
 
 - Tabs are shown as a **table** with the columns **URL** (shortened; hover for the full URL; click to open), **Title** and **Description** (a 1–2 sentence summary of the page; "—" when unknown). Machine → profile → window are **group header rows** with their own checkboxes. The Archive table adds an **Archived** column and groups by machine → profile → date. **Tree view** in the toolbar switches back to the old tree; the choice is remembered.
+- **Row buttons** (between the checkbox and the URL) act on that one tab, using the same server actions as the toolbar:
+  - **Delete** (trash) closes the tab without archiving, after a confirmation.
+  - **Save offline** (download arrow) saves an MHTML copy. It shows a spinner while saving and a green ✓ once a copy exists; clicking ✓ saves a fresh copy. It is disabled for pages that can't be captured (`chrome://`, `about:`, extension pages).
+  - **Archive** (box) closes the tab and keeps it in the Archive.
+  - Archived rows have **Delete permanently** and **Restore** (to the Target client) instead.
+  - Each button's tooltip names its action, a message confirms the result or shows the error, and only that tab is deselected; other checked rows stay checked.
 - **Sorting:** click the **URL**, **Title**, **Description** (or **Archived**) column headers. Each click cycles ascending ▲ → descending ▼ → original browser order.
   - URL sorts by site (host without `www.`), then by the full URL.
   - Tabs without a title or description go last.
