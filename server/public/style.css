@@ -200,3 +200,46 @@ button.rb.busy svg { animation: rb-spin .8s linear infinite; }
 table.tt.archive col.w-url { width: 21%; }
 table.tt.archive col.w-title { width: 22%; }
 table.tt.archive col.w-date { width: 150px; }
+
+/* ---------- phase 7: single-line rows, 25/25/50 columns, hover popover ---------- */
+/* Every tab row is exactly one line: fixed height, nothing wraps, text truncates with an ellipsis. */
+:root { --row-h: 38px; }
+table.tt tr.leaf td {
+  height: var(--row-h); padding-top: 0; padding-bottom: 0; vertical-align: middle;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+table.tt tr.leaf td.c-cb input { margin: 0; vertical-align: middle; }
+table.tt .one-line { display: flex; align-items: center; gap: 6px; min-width: 0; height: var(--row-h); overflow: hidden; white-space: nowrap; }
+table.tt .one-line .txt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.tt .one-line .fav { flex: none; margin: 0; }
+/* Title: the title text shrinks first; badges keep their size but never wrap. */
+table.tt td.c-title .one-line .label { flex: 0 1 auto; margin: 0; }
+table.tt td.c-title .one-line .badge { flex: none; margin: 0; white-space: nowrap; }
+table.tt td.c-title .one-line .badge.src { flex: 0 1 auto; min-width: 40px; overflow: hidden; text-overflow: ellipsis; }
+table.tt td.c-url .one-line .txt { color: var(--accent); }
+table.tt td.c-desc .one-line .txt { color: inherit; }
+table.tt td.c-date .one-line .txt { color: var(--muted); }
+/* Row buttons fit the single line. */
+table.tt .row-btns { flex-wrap: nowrap; }
+table.tt button.rb { width: 28px; height: 24px; }
+/* Hover actions over the description cell stay on the row's line. */
+table.tt td.c-desc .actions { top: 50%; transform: translateY(-50%); }
+/* Group header rows: one line too, slightly taller, labels truncate instead of wrapping. */
+table.tt tr.grp td { white-space: nowrap; overflow: hidden; }
+table.tt tr.grp .grp-line { flex-wrap: nowrap; overflow: hidden; }
+table.tt tr.grp .grp-line > * { flex: none; }
+table.tt tr.grp .grp-line .label { flex: 0 1 auto; min-width: 0; }
+table.tt thead th { overflow: hidden; text-overflow: ellipsis; }
+
+/* Styled popover with the full text of a truncated cell (native title tooltip is the fallback). */
+#cell-pop {
+  position: fixed; z-index: 50; max-width: 560px; padding: 8px 11px; border-radius: 8px;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  box-shadow: 0 6px 24px rgba(0,0,0,.18); font-size: 13px; line-height: 1.45;
+  white-space: normal; overflow-wrap: anywhere; pointer-events: none;
+}
+#cell-pop.url { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--accent); }
+#cell-pop[hidden] { display: none; }
+/* Flat list: the source badge gives way before the title does. */
+table.tt td.c-title .one-line .label { flex: 0 1 auto; flex-shrink: 1; min-width: 48px; }
+table.tt td.c-title .one-line .badge.src { flex: 0 100 auto; min-width: 36px; max-width: 45%; }

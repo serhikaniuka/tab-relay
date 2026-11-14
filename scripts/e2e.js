@@ -27,6 +27,33 @@ const tree = async () => (await api('GET', '/api/tree')).clients;
 const tabsOf = async (machine) => ((await tree()).find((c) => c.machine === machine)?.windows || []).flatMap((w) => w.tabs);
 const step = (s) => console.log('✓', s);
 
+// Table layout: every tab row is one line, same height; URL/Title/Description split 25/25/50.
+async function layoutCheck(page, sel) {
+  const r = await page.evaluate((sel) => {
+    const t = document.querySelector(sel);
+    if (!t) return { missing: true };
+    const w = (cls) => t.querySelector(`thead th:nth-child(${cls})`).getBoundingClientRect().width;
+    const [u, ti, d] = [3, 4, 5].map(w);
+    const rows = [...t.querySelectorAll('tbody tr.leaf')];
+    const heights = rows.map((tr) => Math.round(tr.getBoundingClientRect().height));
+    const wrapped = [];
+    for (const tr of rows) {
+      for (const txt of tr.querySelectorAll('td.c-url .txt, td.c-title .txt, td.c-desc .txt, td.c-date .txt')) {
+        const rects = txt.getClientRects();
+        if (rects.length > 1 || txt.getBoundingClientRect().height > 24) wrapped.push(txt.textContent.slice(0, 40));
+      }
+      for (const b of tr.querySelectorAll('td.c-act button')) if (b.getBoundingClientRect().height > tr.getBoundingClientRect().height) wrapped.push('button');
+    }
+    return { url: u / (u + ti + d), title: ti / (u + ti + d), desc: d / (u + ti + d), heights, wrapped };
+  }, sel);
+  if (r.missing) throw new Error(`layout: ${sel} not found`);
+  const near = (x, y) => Math.abs(x - y) < 0.015;
+  if (!near(r.url, 0.25) || !near(r.title, 0.25) || !near(r.desc, 0.5)) throw new Error(`${sel} column ratios ${r.url.toFixed(3)}/${r.title.toFixed(3)}/${r.desc.toFixed(3)}`);
+  if (r.heights.length && (Math.max(...r.heights) !== Math.min(...r.heights) || Math.max(...r.heights) > 42)) throw new Error(`${sel} row heights ${r.heights}`);
+  if (r.wrapped.length) throw new Error(`${sel} wrapped text: ${r.wrapped}`);
+  return `${r.heights.length} rows × ${r.heights[0] || '-'}px, ${Math.round(r.url * 100)}/${Math.round(r.title * 100)}/${Math.round(r.desc * 100)}`;
+}
+
 // Test website: /one and /two, with a red <h1> so rendering of the saved copy can be checked.
 const site = http.createServer((req, res) => {
   const name = req.url.replace(/\W/g, '') || 'root';
@@ -104,6 +131,22 @@ async function browser(name) {
     const order = await row1.locator('td').evaluateAll((tds) => tds.map((td) => td.className.split(' ')[0]));
     if (JSON.stringify(order) !== '["c-cb","c-act","c-url","c-title","c-desc"]') throw new Error('column order: ' + order);
     step(`table row: ${JSON.stringify(cells.map((c) => c.split('\n')[0]))}, columns ${order.join(' | ')}`);
+    step(`single-line layout, live grouped: ${await layoutCheck(ui, 'table.tt:not(.archive)')}; archive: ${await layoutCheck(ui, 'table.tt.archive')}`);
+
+    // Hover popover with the full text of a truncated description (page three: ~200 chars).
+    {
+      const td = ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page three' }).first().locator('td.c-desc');
+      const full = await td.getAttribute('title');
+      await td.locator('.txt').hover({ position: { x: 8, y: 6 } });
+      await ui.waitForSelector('#cell-pop:not([hidden])', { timeout: 3000 });
+      const popText = await ui.textContent('#cell-pop');
+      if (popText !== full || !full.startsWith('lorem ipsum') || full.length < 150) throw new Error(`popover text: ${popText.slice(0, 50)}`);
+      if (await td.getAttribute('title') !== null) throw new Error('native tooltip should be suppressed while the popover is shown');
+      await ui.mouse.move(5, 5);
+      await ui.waitForSelector('#cell-pop', { state: 'hidden' });
+      if (await td.getAttribute('title') !== full) throw new Error('native tooltip not restored');
+      step(`hover popover shows the full ${full.length}-char description of a truncated cell`);
+    }
     await ui.locator('table.tt:not(.archive) tr.leaf', { hasText: 'Page three' }).first()
       .dragTo(ui.locator('table.tt:not(.archive) tr.grp.profile', { hasText: 'beta-prof' }));
     await until(async () => (await tabsOf('beta')).some((t) => t.url === `${SITE}/three`), 'moved tab opened on beta');
@@ -123,6 +166,7 @@ async function browser(name) {
     await ui.waitForSelector(`${LIVE}.flat`);
     if (await ui.locator(`${LIVE} tr.grp`).count()) throw new Error('flat list still has group rows');
     if (await ui.locator('.drop-strip .chip').count() !== 2) throw new Error('flat list: expected 2 drop chips');
+    const flatLayout = await layoutCheck(ui, `${LIVE}.flat`);
     const original = await urls();
     await ui.click(`${LIVE} th.sortable:has-text("URL")`);
     const asc = await urls();
@@ -153,6 +197,7 @@ async function browser(name) {
     await ui.click(`${LIVE} th.sortable:has-text("Title")`);
     await ui.click(`${LIVE} th.sortable:has-text("Title")`);
     if (JSON.stringify(await urls()) !== JSON.stringify(grouped)) throw new Error('grouped original order not restored');
+    step(`flat list layout: ${flatLayout}`);
     step(`sorting: flat URL ▲/▼/original over ${original.length} tabs, remembered after reload; title sort within ${winTitles.length} windows`);
 
     // 4. UI shows the archive section and offline badges

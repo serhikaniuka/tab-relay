@@ -219,3 +219,27 @@ Data locations (all git-ignored):
   - The earlier e2e column check now uses the cell classes, and also asserts the column order: checkbox | buttons | URL | Title | Description.
   - The full e2e passes.
 - **What you need to do:** the server was restarted (for the `capturing` flag). **Just refresh the web UI page.** The extension is unchanged, so there's no need to reload it.
+
+## Phase 7: single-line rows and 25/25/50 columns
+
+- **One line per tab row**, in the live and archive tables, grouped and flat:
+  - The height is fixed at 38 px (39 px with the border).
+  - Checkbox, row buttons (now 24 px tall), favicon, text and badges sit on one vertically centred line.
+  - In the Title cell the title text shrinks first and badges stay whole. The flat-list source badge gives way before the title does.
+  - Group header rows stay single-line too, slightly taller, and their labels truncate instead of wrapping.
+  - The archive's Archived cell uses a compact `YYYY-MM-DD HH:MM`, with the full date/time in its tooltip.
+- **Column widths:** `table-layout: fixed` with a `colgroup`.
+  - Checkbox (its width depends on the indentation depth), row buttons (112 px live, 80 px archive) and Archived (150 px) are fixed.
+  - Of the remaining width, **URL 25 %, Title 25 %, Description 50 %**.
+  - Chrome ignores `calc(100% - Npx)` on `<col>` (it split the three columns equally), so a `ResizeObserver` measures the flexible width into a CSS variable `--flex-w`, and the columns use `calc(var(--flex-w) * 0.25 / 0.25 / 0.5)`. This holds on window resize, in both tables and in flat mode.
+- **Overflow:** URL, Title, Description (and Archived) use `white-space: nowrap; overflow: hidden; text-overflow: ellipsis`.
+  - Each cell carries the full text in a native `title` tooltip.
+  - When the text is actually truncated, or the URL is shown shortened, hovering for 350 ms shows a **styled popover** with the full text, URLs in monospace. The native tooltip is suppressed meanwhile so the two don't stack. The popover hides on mouse-out, scroll and drag.
+- **Unchanged:** row buttons, hover actions, sorting, grouping, flat list, drag & drop and bulk actions all work as before.
+- **Tests:** all 33 server tests pass. The e2e now checks:
+  - live grouped, archive and flat tables have every row one line at the same height (39 px);
+  - no URL / Title / Description / Archived text wraps;
+  - the URL / Title / Description width ratios are 25/25/50 within ±1.5 %;
+  - the popover shows the full 198-character description of a truncated cell, the native tooltip is suppressed while it shows and restored after.
+  - The full e2e passes.
+- **What you need to do:** only static files changed (`server/public/`), served straight from disk, so there was no server restart. **Just refresh the web UI page (Ctrl+Shift+R if the browser cached the old files).** The extension is unchanged, so there's no need to reload it.

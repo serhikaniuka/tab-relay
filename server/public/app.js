@@ -432,12 +432,15 @@ function shortUrl(url) {
   if (s.endsWith('/') && s.indexOf('/') === s.length - 1) s = s.slice(0, -1);
   return s.length > 52 ? `${s.slice(0, 34)}…${s.slice(-16)}` : s;
 }
+// URL / Title / Description cells are one line: the text part (.txt) truncates with an ellipsis;
+// `title` holds the full text (native tooltip), and the hover popover shows it when it's cut off.
 function urlCell(url, fav) {
   const safe = /^(https?|ftp|file):/i.test(url) ? url : null;
   const text = url ? shortUrl(url) : '—';
-  return el('td', { class: 'c-url', title: url },
-    favicon(fav),
-    safe ? el('a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, text) : el('span', {}, text));
+  return el('td', { class: 'c-url', title: url || '' },
+    el('div', { class: 'one-line' },
+      favicon(fav),
+      safe ? el('a', { class: 'txt', href: safe, target: '_blank', rel: 'noopener noreferrer' }, text) : el('span', { class: 'txt' }, text)));
 }
 
 // Layout: group header rows are indented INDENT px per level; a tab row's checkbox sits where its
@@ -450,16 +453,20 @@ const leafPad = (depth) => PAD + depth * INDENT + (depth ? TWISTY : 0);
 function tableRows(n, depth, cols, out, flat, archive = false) {
   if (n.type === 'leaf') {
     const cb = leafCheckbox(n.key, n.set);
-    const tr = el('tr', { class: `leaf ${n.cls}`, title: n.tip, 'data-key': n.key },
-      el('td', { class: 'c-cb', style: `padding-left:${leafPad(depth)}px` }, cb),
+    // Compact "YYYY-MM-DD HH:MM" in the cell (fits one line), full date/time in the tooltip.
+    const date = n.archivedAt ? `${day(n.archivedAt)} ${new Date(n.archivedAt).toTimeString().slice(0, 5)}` : '';
+    const dateFull = n.archivedAt ? new Date(n.archivedAt).toLocaleString() : '';
+    const tr = el('tr', { class: `leaf ${n.cls}`, 'data-key': n.key },
+      el('td', { class: 'c-cb', style: `padding-left:${leafPad(depth)}px`, title: n.tip }, cb),
       el('td', { class: 'c-act' }, el('div', { class: 'row-btns' }, n.rowActions)),
       urlCell(n.url, n.fav),
-      el('td', { class: 'c-title' }, el('div', { class: 'clamp' }, el('span', { class: 'label' }, n.title), n.badges,
-        flat && n.src ? el('span', { class: 'badge src', title: `from ${n.src}` }, n.src) : null)),
+      el('td', { class: 'c-title', title: n.title + (flat && n.src ? `\nfrom ${n.src}` : '') },
+        el('div', { class: 'one-line' }, el('span', { class: 'label txt' }, n.title), n.badges,
+          flat && n.src ? el('span', { class: 'badge src' }, n.src) : null)),
       el('td', { class: `c-desc${n.description ? '' : ' none'}`, title: n.description || 'No description known' },
-        el('div', { class: 'clamp' }, n.description || '—'),
+        el('div', { class: 'one-line' }, el('span', { class: 'txt' }, n.description || '—')),
         n.hoverActions?.length ? el('span', { class: 'actions' }, n.hoverActions) : null),
-      archive ? el('td', { class: 'c-date' }, n.archivedAt ? new Date(n.archivedAt).toLocaleString() : '') : null);
+      archive ? el('td', { class: 'c-date', title: dateFull }, el('div', { class: 'one-line' }, el('span', { class: 'txt' }, date))) : null);
     tr.querySelector('.label').addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
     makeDraggable(tr, n.set, leafDragKeys(n));
     out.push(tr);
@@ -536,6 +543,24 @@ function collectLeaves(nodes, out = []) {
   return out;
 }
 
+// Column widths: checkbox, row buttons (and Archived) are fixed; of the remaining width, URL gets
+// 25 %, Title 25 % and Description 50 %. Chrome ignores calc(100% - px) on <col>, so the flexible
+// width is measured (sizeTables) into --flex-w and the cols use pure-pixel calc() on it.
+const COL_ACT = { live: 112, archive: 80 };   // 3 / 2 row buttons
+const COL_DATE = 150;
+const FLEX = { url: 0.25, title: 0.25, desc: 0.5 };
+function colgroup(cbWidth, archive) {
+  const fixed = cbWidth + (archive ? COL_ACT.archive + COL_DATE : COL_ACT.live);
+  const flex = (f) => `width:calc(var(--flex-w, 600px) * ${f})`;
+  return el('colgroup', { 'data-fixed': fixed },
+    el('col', { class: 'w-cb', style: `width:${cbWidth}px` }),
+    el('col', { class: 'w-act', style: `width:${archive ? COL_ACT.archive : COL_ACT.live}px` }),
+    el('col', { class: 'w-url', style: flex(FLEX.url) }),
+    el('col', { class: 'w-title', style: flex(FLEX.title) }),
+    el('col', { class: 'w-desc', style: flex(FLEX.desc) }),
+    archive ? el('col', { class: 'w-date', style: `width:${COL_DATE}px` }) : null);
+}
+
 function tableOf(nodes, { archive = false, flat = false } = {}) {
   const cols = archive ? 6 : 5;
   const rows = [];
@@ -551,11 +576,7 @@ function tableOf(nodes, { archive = false, flat = false } = {}) {
     rows.push(el('tr', { class: 'empty-row' }, el('td', { colspan: cols, class: 'muted' }, archive ? 'Archive is empty.' : 'No tabs.')));
   }
   return el('table', { class: `tt${archive ? ' archive' : ''}${flat ? ' flat' : ''}` },
-    el('colgroup', {},
-      el('col', { class: 'w-cb', style: `width:${leafPad(leafDepth) + 16 + PAD}px` }),
-      el('col', { class: `w-act${archive ? ' two' : ''}` }),
-      el('col', { class: 'w-url' }), el('col', { class: 'w-title' }), el('col', { class: 'w-desc' }),
-      archive ? el('col', { class: 'w-date' }) : null),
+    colgroup(leafPad(leafDepth) + 16 + PAD, archive),
     el('thead', {}, el('tr', {},
       el('th', { class: 'c-cb', style: `padding-left:${leafPad(leafDepth)}px`, title: `Select all ${archive ? 'archived' : 'live'} tabs in this table` },
         allKeys.length ? groupCheckbox(allKeys, set) : null),
@@ -610,6 +631,7 @@ function renderTree() {
   } else {
     root.append(empty || tableOf(live), tableOf([archive], { archive: true }));
   }
+  sizeTables();
   $('#btn-view').textContent = state.view === 'tree' ? 'Table view' : 'Tree view';
   $('#flat-label').hidden = state.view === 'tree';
   $('#flat').checked = state.flat;
@@ -949,6 +971,64 @@ $('#flat').addEventListener('change', (e) => {
   localStorage.setItem('tabRelayFlat', state.flat ? '1' : '0');
   renderTree(); updateSelectionUi();
 });
+
+// Flexible column width for the 25/25/50 split (see colgroup); re-measured on resize.
+function sizeTables() {
+  const width = $('#tree').clientWidth;
+  for (const t of document.querySelectorAll('#tree table.tt')) {
+    const fixed = Number(t.querySelector('colgroup')?.dataset.fixed || 0);
+    t.style.setProperty('--flex-w', `${Math.max(240, width - fixed)}px`);
+  }
+}
+new ResizeObserver(sizeTables).observe($('#tree'));
+
+// ---------- hover popover: full text of truncated URL / Title / Description cells ----------
+const pop = el('div', { id: 'cell-pop', role: 'tooltip', hidden: true });
+document.body.append(pop);
+let popTimer = null;
+let popCell = null;
+function hidePop() {
+  clearTimeout(popTimer);
+  pop.hidden = true;
+  if (popCell?.dataset.title !== undefined) {   // give the native tooltip back
+    popCell.title = popCell.dataset.title;
+    delete popCell.dataset.title;
+  }
+  popCell = null;
+}
+function showPop(td) {
+  const txt = td.querySelector('.txt');
+  if (!txt || !td.isConnected) return;
+  // Only when the text is actually cut off (or the URL is shown shortened).
+  const full = td.title || td.dataset.title || '';
+  const truncated = txt.scrollWidth > txt.clientWidth + 1 || (td.classList.contains('c-url') && full !== txt.textContent);
+  if (!truncated || !full) return;
+  popCell = td;
+  td.dataset.title = td.title;   // avoid a native tooltip on top of the popover
+  td.removeAttribute('title');
+  pop.textContent = full;
+  pop.className = td.classList.contains('c-url') ? 'url' : '';
+  pop.hidden = false;
+  const r = td.getBoundingClientRect();
+  const w = Math.min(560, Math.max(260, r.width + 40));
+  pop.style.maxWidth = `${w}px`;
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8));
+  const below = r.bottom + 6;
+  const top = below + pop.offsetHeight > window.innerHeight - 8 ? r.top - pop.offsetHeight - 6 : below;
+  pop.style.left = `${left}px`;
+  pop.style.top = `${Math.max(8, top)}px`;
+}
+const POP_CELLS = 'table.tt tr.leaf td.c-url, table.tt tr.leaf td.c-title, table.tt tr.leaf td.c-desc';
+$('#tree').addEventListener('mouseover', (e) => {
+  const td = e.target.closest(POP_CELLS);
+  if (td === popCell) return;
+  hidePop();
+  if (!td || state.dragging || e.target.closest('.actions, button')) return;
+  popTimer = setTimeout(() => showPop(td), 350);
+});
+$('#tree').addEventListener('mouseleave', hidePop);
+window.addEventListener('scroll', hidePop, { passive: true });
+document.addEventListener('dragstart', hidePop);
 
 // Keep the sticky table header just below the (variable-height) sticky toolbar.
 new ResizeObserver(() => document.documentElement.style.setProperty('--toolbar-h', `${$('#toolbar').offsetHeight}px`)).observe($('#toolbar'));
