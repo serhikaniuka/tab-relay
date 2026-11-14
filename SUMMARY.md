@@ -172,3 +172,21 @@ Data locations (all git-ignored):
   - All earlier steps still pass on the table: drag & drop move, archive + offline, restore, delete, Remove client.
 - **⚠ Reload the extension on every machine** (the reload button on its card in `chrome://extensions`, or Load unpacked again after pulling). Version 0.3.0 **asks for new permissions**: "Read and change all your data on all websites" (`<all_urls>`, needed to read page descriptions) and `scripting`. Chrome may disable the extension until you accept them; re-enable it on its card.
   - Until it's reloaded, the old extension sends no descriptions; the server fallback fills them in for public pages only.
+
+## Phase 5: table polish (spacing, sorting)
+
+- **Spacing:**
+  - Cells have 9 px × 12 px padding, tab rows are at least 44 px high, and the header row has more room and a 2 px rule.
+  - Group header rows are indented 20 px per level (machine / profile / window, or archive machine / profile / date). Each tab row's checkbox is indented to line up under its parent group's children.
+  - Machine groups are separated by a gap. The toolbar, the layout margins (24 px) and the sidebar have more breathing room.
+  - The archive table uses the same rules.
+- **Sorting:** clickable column headers (**URL**, **Title**, **Description**, and **Archived** in the archive) with an arrow indicator. Each click cycles ▲ → ▼ → original browser order (the default).
+  - URL sorts by host (without `www.`), then by the full URL, using locale-aware, numeric comparison. Empty titles and descriptions go last. Ties keep browser order.
+  - Sorting applies within each window (or archive date group), so grouping stays.
+  - **Flat list (no grouping)** in the toolbar sorts all tabs, and all archived tabs, globally. Rows then show their source machine/profile as a badge, and since there are no profile rows, client "drop chips" above the table keep drag-and-drop working.
+  - The header has a select-all checkbox per table.
+  - The sort and flat choice are saved in localStorage. The tree view uses the same sort order.
+- **Code:** front-end only (`server/public/`). No server or extension changes, so there is no need to reload the extension for this phase.
+- **Tests:** all 33 server tests pass (unchanged).
+  - The e2e now also checks: the flat list has no group rows and shows 2 drop chips; URL ascending/descending matches the expected host-then-URL order; the ▲/▼ indicator; the choice survives a page reload; the third click restores the original order; title sort within each window keeps the groups; turning sorting off restores the grouped browser order.
+  - The whole e2e passes, including all earlier steps.

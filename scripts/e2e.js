@@ -108,6 +108,51 @@ async function browser(name) {
     await until(async () => !(await tab('three')), 'moved tab closed on alpha');
     step('drag & drop move alpha → beta');
 
+    // Sorting + flat list
+    const LIVE = 'table.tt:not(.archive)';
+    const coll = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+    const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./i, ''); } catch (e) { return u; } };
+    const byUrl = (a, b) => coll.compare(hostOf(a), hostOf(b)) || coll.compare(a, b);
+    const urls = async () => ui.locator(`${LIVE} tr.leaf td.c-url`).evaluateAll((tds) => tds.map((td) => td.title));
+    await ui.reload();
+    await ui.waitForSelector(`${LIVE} tr.leaf`);
+    const grouped = await urls();
+    await ui.check('#flat');
+    await ui.waitForSelector(`${LIVE}.flat`);
+    if (await ui.locator(`${LIVE} tr.grp`).count()) throw new Error('flat list still has group rows');
+    if (await ui.locator('.drop-strip .chip').count() !== 2) throw new Error('flat list: expected 2 drop chips');
+    const original = await urls();
+    await ui.click(`${LIVE} th.sortable:has-text("URL")`);
+    const asc = await urls();
+    if (JSON.stringify(asc) !== JSON.stringify([...original].sort(byUrl))) throw new Error('URL asc: ' + asc);
+    if ((await ui.textContent(`${LIVE} th.sorted`)).trim() !== 'URL▲') throw new Error('arrow');
+    await ui.click(`${LIVE} th.sortable:has-text("URL")`);
+    const desc = await urls();
+    if (JSON.stringify(desc) !== JSON.stringify([...original].sort((a, b) => -byUrl(a, b)))) throw new Error('URL desc: ' + desc);
+    await ui.reload();   // remembered in localStorage
+    await ui.waitForSelector(`${LIVE}.flat th.sorted`);
+    if ((await ui.textContent(`${LIVE} th.sorted`)).trim() !== 'URL▼' || JSON.stringify(await urls()) !== JSON.stringify(desc)) throw new Error('sort not remembered');
+    await ui.click(`${LIVE} th.sortable:has-text("URL")`);   // third click: original order
+    if (JSON.stringify(await urls()) !== JSON.stringify(original) || await ui.locator(`${LIVE} th.sorted`).count()) throw new Error('reset to original order');
+    await ui.uncheck('#flat');
+    // Grouped + sorted: groups stay, tabs sorted within each window.
+    await ui.click(`${LIVE} th.sortable:has-text("Title")`);
+    await ui.waitForSelector(`${LIVE} tr.grp.window`);
+    const winTitles = await ui.locator(`${LIVE} tbody tr`).evaluateAll((trs) => {
+      const out = []; let cur = null;
+      for (const tr of trs) {
+        if (tr.classList.contains('window')) out.push(cur = []);
+        else if (tr.classList.contains('leaf') && cur) cur.push(tr.querySelector('td.c-title .label').textContent);
+      }
+      return out;
+    });
+    for (const w of winTitles) if (JSON.stringify(w) !== JSON.stringify([...w].sort(coll.compare))) throw new Error('title sort within window: ' + w);
+    await ui.screenshot({ path: path.join(WORK, 'ui-sorted.png'), fullPage: true });
+    await ui.click(`${LIVE} th.sortable:has-text("Title")`);
+    await ui.click(`${LIVE} th.sortable:has-text("Title")`);
+    if (JSON.stringify(await urls()) !== JSON.stringify(grouped)) throw new Error('grouped original order not restored');
+    step(`sorting: flat URL ▲/▼/original over ${original.length} tabs, remembered after reload; title sort within ${winTitles.length} windows`);
+
     // 4. UI shows the archive section and offline badges
     await ui.reload();
     await ui.waitForSelector('table.tt.archive tr.leaf');

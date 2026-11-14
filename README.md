@@ -97,6 +97,12 @@ Click the extension's toolbar icon to open the web UI. The token is passed in th
 Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localStorage).
 
 - Tabs are shown as a **table** with the columns **URL** (shortened; hover for the full URL; click to open), **Title** and **Description** (a 1–2 sentence summary of the page; "—" when unknown). Machine → profile → window are **group header rows** with their own checkboxes. The Archive table adds an **Archived** column and groups by machine → profile → date. **Tree view** in the toolbar switches back to the old tree; the choice is remembered.
+- **Sorting:** click the **URL**, **Title**, **Description** (or **Archived**) column headers. Each click cycles ascending ▲ → descending ▼ → original browser order.
+  - URL sorts by site (host without `www.`), then by the full URL.
+  - Tabs without a title or description go last.
+  - Sorting applies within each window (and each archive date), so the machine → profile → window grouping stays.
+  - **Flat list (no grouping)** in the toolbar shows all tabs as one list, so a sort applies across everything. Each row then shows its source machine/profile, and drag targets appear as chips above the table.
+  - The sort and the flat setting are remembered in the browser.
 - Tick checkboxes on machines, profiles, windows or single tabs. The filter box narrows the tree. All toolbar buttons are bulk actions on the current selection.
 - Hovering over any tab, window, profile or machine shows quick buttons for that node: **Move, Archive, Archive+offline, Offline, Delete**. Archive nodes show **Restore** and **Delete**.
 - Pick a **Target** client. With **new window** ticked, the tabs open in new windows, one per source window, so moving a whole profile keeps its window layout.

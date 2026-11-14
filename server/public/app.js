@@ -18,6 +18,14 @@ const state = {
   filter: '',
   dragging: false,
   view: localStorage.getItem('tabRelayView') === 'tree' ? 'tree' : 'table',
+  flat: localStorage.getItem('tabRelayFlat') === '1',
+  sort: (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem('tabRelaySort'));
+      if (v && ['none', 'url', 'title', 'desc', 'date'].includes(v.key) && (v.dir === 1 || v.dir === -1)) return v;
+    } catch (e) { /* default */ }
+    return { key: 'none', dir: 1 };
+  })(),
 };
 
 // ---------- helpers ----------
@@ -347,13 +355,21 @@ function urlCell(url, fav) {
     safe ? el('a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, text) : el('span', {}, text));
 }
 
-function tableRows(n, depth, cols, out) {
+// Layout: group header rows are indented INDENT px per level; a tab row's checkbox sits where its
+// parent's children start, so tabs line up under their window (or date, in the archive).
+const PAD = 12;
+const INDENT = 20;
+const TWISTY = 22;   // twisty width + gap in group rows
+const leafPad = (depth) => PAD + depth * INDENT + (depth ? TWISTY : 0);
+
+function tableRows(n, depth, cols, out, flat) {
   if (n.type === 'leaf') {
     const cb = leafCheckbox(n.key, n.set);
     const tr = el('tr', { class: `leaf ${n.cls}`, title: n.tip },
-      el('td', { class: 'c-cb' }, cb),
+      el('td', { class: 'c-cb', style: `padding-left:${leafPad(depth)}px` }, cb),
       urlCell(n.url, n.fav),
-      el('td', { class: 'c-title' }, el('div', { class: 'clamp' }, el('span', { class: 'label' }, n.title), n.badges)),
+      el('td', { class: 'c-title' }, el('div', { class: 'clamp' }, el('span', { class: 'label' }, n.title), n.badges,
+        flat && n.src ? el('span', { class: 'badge src', title: `from ${n.src}` }, n.src) : null)),
       el('td', { class: `c-desc${n.description ? '' : ' none'}`, title: n.description || 'No description known' },
         el('div', { class: 'clamp' }, n.description || '—'),
         el('span', { class: 'actions' }, n.actions)),
@@ -366,7 +382,7 @@ function tableRows(n, depth, cols, out) {
   if (n.hidden) return;
   const collapsed = state.collapsed.has(n.key);
   const toggle = () => { toggleCollapsed(n.key); renderTree(); updateSelectionUi(); };
-  const cell = el('td', { colspan: cols, style: `padding-left:${8 + depth * 18}px` },
+  const cell = el('td', { colspan: cols, style: `padding-left:${PAD + depth * INDENT}px` },
     el('div', { class: 'grp-line' },
       el('span', { class: 'twisty', onclick: toggle }), groupCheckbox(n.keys, n.set), n.content,
       n.actions.length ? el('span', { class: 'actions' }, n.actions) : null));
@@ -375,19 +391,104 @@ function tableRows(n, depth, cols, out) {
   if (n.drag && n.keys.length) makeDraggable(tr, n.set, () => n.keys);
   if (n.dropClient) makeDropTarget(tr, n.dropClient);
   out.push(tr);
-  if (!collapsed) for (const c of n.children) tableRows(c, depth + 1, cols, out);
+  if (!collapsed) for (const c of n.children) tableRows(c, depth + 1, cols, out, flat);
 }
 
-function tableOf(nodes, { archive = false } = {}) {
+// ---- sorting ----
+// state.sort = {key: 'none'|'url'|'title'|'desc'|'date', dir: 1|-1}. Sorting reorders tabs inside
+// their group (window / archive date); in flat mode it orders all tabs. Ties keep browser order.
+const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+const cmp = (x, y) => collator.compare(x || '', y || '');
+function hostOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./i, ''); } catch (e) { return url || ''; }
+}
+const SORTS = {
+  url: { label: 'URL', fn: (a, b) => cmp(hostOf(a.url), hostOf(b.url)) || cmp(a.url, b.url) },
+  title: { label: 'Title', fn: (a, b) => cmp(a.sortTitle, b.sortTitle), field: 'sortTitle' },
+  desc: { label: 'Description', fn: (a, b) => cmp(a.description, b.description), field: 'description' },
+  date: { label: 'Archived', fn: (a, b) => (a.archivedAt || 0) - (b.archivedAt || 0) },
+};
+function sortLeaves(leaves) {
+  const { key, dir } = state.sort;
+  const s = SORTS[key];
+  if (!s) return leaves;
+  return leaves.slice().sort((a, b) => {
+    if (s.field) {   // rows without a title/description go last in both directions
+      const ea = !a[s.field];
+      const eb = !b[s.field];
+      if (ea !== eb) return ea ? 1 : -1;
+    }
+    return dir * s.fn(a, b);
+  });
+}
+function setSort(key) {
+  const cur = state.sort;
+  // Click cycle per column: ascending → descending → original browser order.
+  state.sort = cur.key !== key ? { key, dir: 1 } : cur.dir === 1 ? { key, dir: -1 } : { key: 'none', dir: 1 };
+  localStorage.setItem('tabRelaySort', JSON.stringify(state.sort));
+  renderTree();
+  updateSelectionUi();
+}
+function sortHeader(key, extraClass = '') {
+  const active = state.sort.key === key;
+  const arrow = active ? (state.sort.dir === 1 ? '▲' : '▼') : '↕';
+  const next = !active ? 'ascending' : state.sort.dir === 1 ? 'descending' : 'original order';
+  return el('th', {
+    class: `sortable${active ? ' sorted' : ''} ${extraClass}`, tabindex: '0', role: 'button',
+    'aria-sort': active ? (state.sort.dir === 1 ? 'ascending' : 'descending') : 'none',
+    title: `Sort by ${SORTS[key].label.toLowerCase()}${key === 'url' ? ' (site, then full URL)' : ''}: click for ${next}`,
+    onclick: () => setSort(key),
+    onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSort(key); } },
+  }, SORTS[key].label, el('span', { class: 'arrow' }, arrow));
+}
+
+function collectLeaves(nodes, out = []) {
+  for (const n of nodes) {
+    if (n.type === 'leaf') out.push(n);
+    else if (!n.hidden) collectLeaves(n.children, out);
+  }
+  return out;
+}
+
+function tableOf(nodes, { archive = false, flat = false } = {}) {
   const cols = archive ? 5 : 4;
   const rows = [];
-  for (const n of nodes) tableRows(n, 0, cols, rows);
-  return el('table', { class: `tt${archive ? ' archive' : ''}` },
-    el('colgroup', {}, el('col', { class: 'w-cb' }), el('col', { class: 'w-url' }), el('col', { class: 'w-title' }),
-      el('col', { class: 'w-desc' }), archive ? el('col', { class: 'w-date' }) : null),
-    el('thead', {}, el('tr', {}, el('th', {}), el('th', {}, 'URL'), el('th', {}, 'Title'), el('th', {}, 'Description'),
-      archive ? el('th', {}, 'Archived') : null)),
+  if (flat) {
+    for (const leaf of sortLeaves(collectLeaves(nodes))) tableRows(leaf, 0, cols, rows, true);
+  } else {
+    for (const n of nodes) tableRows(n, 0, cols, rows, false);
+  }
+  const leafDepth = flat ? 0 : archive ? 4 : 3;
+  const allKeys = collectLeaves(nodes).map((l) => l.key);
+  const set = archive ? 'archive' : 'live';
+  if (!rows.length && flat) {
+    rows.push(el('tr', { class: 'empty-row' }, el('td', { colspan: cols, class: 'muted' }, archive ? 'Archive is empty.' : 'No tabs.')));
+  }
+  return el('table', { class: `tt${archive ? ' archive' : ''}${flat ? ' flat' : ''}` },
+    el('colgroup', {},
+      el('col', { class: 'w-cb', style: `width:${leafPad(leafDepth) + 16 + PAD}px` }),
+      el('col', { class: 'w-url' }), el('col', { class: 'w-title' }), el('col', { class: 'w-desc' }),
+      archive ? el('col', { class: 'w-date' }) : null),
+    el('thead', {}, el('tr', {},
+      el('th', { class: 'c-cb', style: `padding-left:${leafPad(leafDepth)}px`, title: `Select all ${archive ? 'archived' : 'live'} tabs in this table` },
+        allKeys.length ? groupCheckbox(allKeys, set) : null),
+      sortHeader('url'), sortHeader('title'), sortHeader('desc'),
+      archive ? sortHeader('date', 'c-date') : null)),
     el('tbody', {}, rows));
+}
+
+// Flat mode has no profile rows to drop onto: offer each client as a drop chip instead.
+function dropStrip() {
+  const clients = state.tree?.clients || [];
+  if (!clients.length) return '';
+  return el('div', { class: 'drop-strip' },
+    el('span', { class: 'muted small' }, 'Drop tabs on a profile to move them (Ctrl = copy):'),
+    clients.map((c) => {
+      const chip = el('span', { class: 'chip', title: `client ${c.id}` },
+        el('span', { class: `dot${c.online ? ' on' : ''}` }), clientName(c));
+      makeDropTarget(chip, c.id);
+      return chip;
+    }));
 }
 
 function favicon(url) {
@@ -416,10 +517,14 @@ function renderTree() {
     'No clients yet. Install the extension in Chrome, set the server URL and token in its options, and it will appear here.');
   if (state.view === 'tree') {
     root.append(empty || '', ...live.map(treeNode), treeNode(archive));
+  } else if (state.flat) {
+    root.append(dropStrip(), empty || tableOf(live, { flat: true }), tableOf([archive], { archive: true, flat: true }));
   } else {
     root.append(empty || tableOf(live), tableOf([archive], { archive: true }));
   }
   $('#btn-view').textContent = state.view === 'tree' ? 'Table view' : 'Tree view';
+  $('#flat-label').hidden = state.view === 'tree';
+  $('#flat').checked = state.flat;
 }
 
 function liveModel() {
@@ -449,7 +554,7 @@ function liveModel() {
             w.focused ? el('span', { class: 'badge' }, 'focused') : null,
             w.incognito ? el('span', { class: 'badge' }, 'incognito') : null,
           ],
-          children: tabs.map((t) => liveTab(c, t, offMap.get(t.url))),
+          children: sortLeaves(tabs.map((t) => liveTab(c, t, offMap.get(t.url)))),
           actions: liveActions(wKeys),
         });
       });
@@ -494,6 +599,7 @@ function liveTab(c, t, off) {
     key, set: 'live', cls: `tab${t.active ? ' active' : ''}${t.closing ? ' closing' : ''}`,
     tip: `${t.title}\n${t.url}${t.description ? `\n\n${t.description}` : ''}\n\nfrom ${clientName(c)}`,
     fav: t.favIconUrl, url: t.url, title: t.title || t.url || '(untitled)', description: t.description,
+    sortTitle: t.title, src: clientName(c),
     badges: [
       t.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       t.closing ? el('span', { class: 'badge warn' }, CLOSING_TEXT[t.closing] || 'closing…') : null,
@@ -530,7 +636,7 @@ function archiveModel() {
         return groupNode({
           key: `ad:${machine}:${p}:${d}`, cls: 'date', set: 'archive', keys: dKeys, drag: true,
           content: [el('span', { class: 'label' }, d), el('span', { class: 'badge' }, plural(list.length, 'tab'))],
-          children: list.map(archiveTab),
+          children: sortLeaves(list.map(archiveTab)),
           actions: archiveActions(dKeys),
         });
       });
@@ -567,6 +673,7 @@ function archiveTab(a) {
     key, set: 'archive', cls: 'tab archived',
     tip: `${a.title}\n${a.url}${a.description ? `\n\n${a.description}` : ''}\n\nfrom ${a.source.machine} — ${profileText(a.source.email, a.source.label)}\narchived ${new Date(a.archivedAt).toLocaleString()}`,
     fav: a.favIconUrl, url: a.url, title: a.title || a.url || '(untitled)', description: a.description, archivedAt: a.archivedAt,
+    sortTitle: a.title, src: `${a.source.machine} — ${profileText(a.source.email, a.source.label)}`,
     badges: [
       a.pinned ? el('span', { class: 'badge' }, 'pinned') : null,
       a.offline ? offlineBadge(a.offline) : null,
@@ -737,6 +844,12 @@ $('#btn-collapse').addEventListener('click', () => {
 $('#btn-view').addEventListener('click', () => {
   state.view = state.view === 'tree' ? 'table' : 'tree';
   localStorage.setItem('tabRelayView', state.view);
+  renderTree(); updateSelectionUi();
+});
+
+$('#flat').addEventListener('change', (e) => {
+  state.flat = e.target.checked;
+  localStorage.setItem('tabRelayFlat', state.flat ? '1' : '0');
   renderTree(); updateSelectionUi();
 });
 
