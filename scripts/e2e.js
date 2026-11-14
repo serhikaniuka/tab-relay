@@ -64,7 +64,10 @@ async function browser(name) {
     const alpha = (await tree()).find((c) => c.machine === 'alpha');
     const beta = (await tree()).find((c) => c.machine === 'beta');
     const tab = async (p) => (await tabsOf('alpha')).find((t) => t.url === `${SITE}/${p}`);
-    step('two clients pushed their tabs');
+    await sleep(4000);   // let first-run pushes/polls settle, then check no duplicate client appeared
+    const all = await tree();
+    if (all.length !== 2) throw new Error(`expected exactly 2 clients (one per profile), got ${all.length}: ${all.map((c) => c.machine + ':' + c.id)}`);
+    step('two clients pushed their tabs, exactly one client id per profile');
 
     // 1. Save offline
     await api('POST', '/api/actions/offline', { tabs: [{ clientId: alpha.id, tabId: (await tab('one')).id }] });
@@ -132,7 +135,19 @@ async function browser(name) {
     if ((await api('GET', '/api/archive')).items.length) throw new Error('delete must not archive');
     step('delete closes the tab without archiving');
 
-    // 8. Optional: a real website (E2E_REAL_URL=https://…), checks images/CSS survive the round trip.
+    // 8. Remove a stale (offline) client from the UI
+    await api('POST', '/api/clients/ghost-client/state', { machine: 'ghost', profile: { label: 'stale' }, windows: [{ id: 1, tabs: [{ id: 1, url: 'https://ghost/' }] }] });
+    await sleep(31000);   // let it go offline
+    await ui.reload();
+    const ghostRow = ui.locator('#tree > .machine .profile > .row', { hasText: 'stale' });
+    await ghostRow.waitFor();
+    ui.once('dialog', (d) => d.accept());
+    await ghostRow.getByRole('button', { name: 'Remove' }).click();
+    await until(async () => !(await tree()).some((c) => c.id === 'ghost-client'), 'ghost client removed');
+    if ((await tree()).length !== 2) throw new Error('live clients must not be removed');
+    step('UI "Remove" deletes an offline client');
+
+    // 9. Optional: a real website (E2E_REAL_URL=https://…), checks images/CSS survive the round trip.
     if (process.env.E2E_REAL_URL) {
       const real = await A.newPage();
       await real.goto(process.env.E2E_REAL_URL, { waitUntil: 'load' });

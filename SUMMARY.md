@@ -101,3 +101,25 @@ Data locations (all git-ignored):
 - Tab ids are only valid for the browser session. Tabs of offline clients show their last known state. Commands for offline clients wait in the queue, with no expiry or cancel button.
 - Tab groups, scroll position, history and form state are not transferred.
 - Tested in headless Chromium and Chrome 156, not yet in a real Chrome signed in to a Google account.
+
+## Phase 3: duplicate clients fix
+
+- **Cause:** on first run, the extension's `getClientId()` did read → generate → write with no lock. The poll loop and the push triggered by saving the options both ran before the id was stored, so each generated its own id. That produced two server clients for one profile, about 1 s apart, with one of them seen only once.
+  - `ensureLoop()` could also start two poll loops at once, because its guard is only set after the first tick's awaits.
+- **Extension 0.2.1:**
+  - Client-id creation goes through one shared promise per service worker (read, then write once; it retries if storage fails).
+  - The poll loop is started at most once.
+- **Server:**
+  - `DELETE /api/clients/:id` removes the client with its windows, tabs and commands, and keeps archive items and offline copies. It returns what it removed.
+  - It used to fail with `FOREIGN KEY constraint failed` when another client's command depended on one of the removed client's commands (e.g. the close half of a move). Those dependents are now cancelled and detached first.
+  - New `POST /api/clients/prune {olderThanDays}` removes offline clients not seen for N days (0 = all offline clients).
+  - There is deliberately no automatic dedupe on push: duplicates stay until you remove them by hand.
+- **Web UI:**
+  - Offline profile nodes have a **Remove** button, which asks for confirmation (showing the client id, tab count and last seen).
+  - The toolbar has **Remove offline clients…**, which prompts for N days and confirms the list of clients first.
+- **Tests:** 24 API tests pass. New ones cover:
+  - a duplicate client is kept on push;
+  - remove with cross-client dependent commands, keeping the archive and offline copy, then 404 / 401;
+  - prune by age.
+- **The live DB is cleaned up:** the stale duplicate `f3c968f5-50e9-4cf1-aa18-2d8ee5e613e8` (devbox / personal, 11 tabs, seen only at creation) is removed through the new endpoint. `d78e7dae-…` is kept.
+- **⚠ Reload the extension on every machine** (the reload button on its card in `chrome://extensions`, or Load unpacked again after pulling) to pick up the fix (v0.2.1). Existing clients keep their stored id, so nothing changes for them; the fix prevents new duplicates on fresh installs and new profiles.

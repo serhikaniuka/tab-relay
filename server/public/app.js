@@ -379,13 +379,9 @@ function renderLive() {
           el('span', { class: 'badge' }, `${c.windows.length} win · ${tabCount} tabs`),
           el('span', { class: 'muted small' }, c.online ? 'online' : `offline · seen ${ago(now - c.lastSeen)}`),
           c.online ? null : el('button', {
-            class: 'link', title: 'Remove this client from the server',
-            onclick: async () => {
-              if (!confirm(`Forget ${clientName(c)}? It will re-appear if the extension connects again.`)) return;
-              await api('DELETE', `/api/clients/${encodeURIComponent(c.id)}`).catch((e) => flash(e.message, true));
-              refresh();
-            },
-          }, 'forget'),
+            class: 'mini danger', title: 'Remove this offline client (e.g. a stale duplicate) from the server',
+            onclick: () => removeClient(c, tabCount),
+          }, 'Remove'),
         ],
         children: winNodes,
         actions: liveActions(pKeys),
@@ -602,6 +598,34 @@ function renderCommands() {
       el('span', { class: 'muted', style: 'margin-left:auto' }, new Date(c.createdAt).toLocaleTimeString())));
   }
 }
+
+// ---------- clients ----------
+const KEEP_NOTE = 'Its archived tabs and offline copies are kept. If the extension connects again with this id, it re-appears.';
+
+async function removeClient(c, tabCount) {
+  if (!confirm(`Remove ${clientName(c)} (client ${c.id.slice(0, 8)}…, ${plural(tabCount, 'tab')}, last seen ${new Date(c.lastSeen).toLocaleString()})?\n\n${KEEP_NOTE}`)) return;
+  try {
+    const r = await api('DELETE', `/api/clients/${encodeURIComponent(c.id)}`);
+    flash(`Removed ${clientName(c)} (${plural(r.removed.tabs, 'tab')}${r.removed.cancelledDependents ? `, ${plural(r.removed.cancelledDependents, 'dependent command')} cancelled` : ''})`);
+    state.sel.live.clear();
+    refresh();
+  } catch (e) { flash(e.message, true); }
+}
+
+$('#btn-prune').addEventListener('click', async () => {
+  const days = prompt('Remove every OFFLINE client not seen for at least this many days (0 = all offline clients):', '7');
+  if (days === null) return;
+  const n = Number(days);
+  if (!Number.isFinite(n) || n < 0) return flash('Enter a number of days ≥ 0', true);
+  const victims = (state.tree?.clients || []).filter((c) => !c.online && state.tree.now - c.lastSeen >= n * 86_400_000);
+  if (!victims.length) return flash(`No offline clients older than ${n} day(s)`);
+  if (!confirm(`Remove ${plural(victims.length, 'offline client')}?\n\n${victims.map(clientName).join('\n')}\n\n${KEEP_NOTE}`)) return;
+  try {
+    const r = await api('POST', '/api/clients/prune', { olderThanDays: n });
+    flash(`Removed ${plural(r.removed.length, 'client')}`);
+    refresh();
+  } catch (e) { flash(e.message, true); }
+});
 
 // ---------- toolbar ----------
 const liveSel = () => [...state.sel.live];

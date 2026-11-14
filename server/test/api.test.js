@@ -470,3 +470,86 @@ test('archive delete removes items and their offline copies', async () => {
   assert.equal(fs.readdirSync(offlineDir).length, before - 1);
   assert.equal((await api('POST', '/api/archive/delete', { ids: [] })).status, 400);
 });
+
+// ---------- phase 3: duplicate / stale clients ----------
+
+test('duplicate clients for one profile are kept as-is on push (no heuristic auto-dedupe)', async () => {
+  const st = (id) => api('POST', `/api/clients/${id}/state`, {
+    machine: 'devbox', profile: { email: '', label: 'personal' },
+    windows: [{ id: 1, tabs: [{ id: 1, index: 0, url: 'https://dup/1' }] }],
+  });
+  await st('dup-stale');
+  clock += 1000;
+  await st('dup-live');
+  clock += 60_000;
+  await st('dup-live');
+  const clients = (await api('GET', '/api/tree')).body.clients.filter((c) => c.machine === 'devbox' && c.profile.label === 'personal');
+  assert.deepEqual(clients.map((c) => [c.id, c.online]).sort(), [['dup-live', true], ['dup-stale', false]]);
+});
+
+test('DELETE /api/clients/:id removes the client, its tabs and commands; keeps archive and offline copies', async () => {
+  // dup-stale gets: a tab, an archive item + offline copy, a pending command, and is the
+  // dependency of another client's pending command (move: close on dup-live waits for open on dup-stale).
+  await api('POST', '/api/clients/dup-stale/state', {
+    machine: 'devbox', profile: { email: '', label: 'personal' },
+    windows: [{ id: 1, tabs: [{ id: 1, index: 0, url: 'https://dup/1' }, { id: 2, index: 1, url: 'https://dup/2' }] }],
+  });
+  const arch = await api('POST', '/api/actions/archive', { offline: true, tabs: [{ clientId: 'dup-stale', tabId: 2 }] });
+  const up = await upload('dup-stale', { tabId: 2, commandId: arch.body.commands[0] });
+  assert.equal(up.status, 201);
+  const move = await api('POST', '/api/actions/move', { targetClientId: 'dup-stale', tabs: [{ clientId: 'dup-live', tabId: 1 }] });
+  const [, dependentClose] = move.body.commands;
+
+  const r = await api('DELETE', '/api/clients/dup-stale');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.removed, { windows: 1, tabs: 2, commands: 3, cancelledDependents: 1 });
+
+  const tree = (await api('GET', '/api/tree')).body.clients;
+  assert.ok(!tree.some((c) => c.id === 'dup-stale'));
+  assert.ok(tree.some((c) => c.id === 'dup-live'), 'the other client is untouched');
+
+  // The dependent close on dup-live is cancelled, not left dangling or delivered.
+  const cmds = (await api('GET', '/api/commands?limit=50')).body.commands;
+  assert.ok(!cmds.some((c) => c.clientId === 'dup-stale'));
+  const dep = cmds.find((c) => c.id === dependentClose);
+  assert.equal(dep.status, 'cancelled');
+  assert.equal(dep.dependsOn, null);
+  assert.equal((await api('GET', '/api/clients/dup-live/commands')).body.commands.length, 0);
+
+  // Archive item and offline copy survive with their source info.
+  const item = (await api('GET', '/api/archive')).body.items.find((a) => a.id === arch.body.archived[0]);
+  assert.equal(item.source.clientId, 'dup-stale');
+  assert.equal(item.source.machine, 'devbox');
+  assert.equal(item.offline.id, up.body.id);
+  const copy = (await api('GET', '/api/offline')).body.items.find((o) => o.id === up.body.id);
+  assert.equal(copy.source.machine, 'devbox');
+  assert.equal((await fetch(`${base}/api/offline/${up.body.id}/raw?token=${TOKEN}`)).status, 200);
+
+  assert.equal((await api('DELETE', '/api/clients/dup-stale')).status, 404);
+  assert.equal((await api('DELETE', '/api/clients/dup-stale', undefined, null)).status, 401);
+  // A removed client that comes back simply re-registers.
+  await api('POST', '/api/clients/dup-stale/state', { machine: 'devbox', windows: [] });
+  assert.equal((await api('DELETE', '/api/clients/dup-stale')).status, 200);
+});
+
+test('POST /api/clients/prune removes only offline clients older than N days', async () => {
+  await api('POST', '/api/clients/old-1/state', { machine: 'old', windows: [{ id: 1, tabs: [{ id: 1, url: 'https://old/' }] }] });
+  clock += 3 * 86_400_000;
+  await api('POST', '/api/clients/fresh-1/state', { machine: 'fresh', windows: [] });
+  clock += 60_000;   // fresh-1 is now offline too, but only for a minute
+
+  assert.equal((await api('POST', '/api/clients/prune', { olderThanDays: -1 })).status, 400);
+  assert.equal((await api('POST', '/api/clients/prune', {})).status, 400);
+
+  let r = await api('POST', '/api/clients/prune', { olderThanDays: 2 });
+  assert.equal(r.status, 200);
+  const removed = r.body.removed.map((c) => c.id);
+  assert.ok(removed.includes('old-1'));
+  assert.ok(!removed.includes('fresh-1'));
+  assert.equal(r.body.removed.find((c) => c.id === 'old-1').tabs, 1);
+
+  await api('POST', '/api/clients/live-1/state', { machine: 'live', windows: [] });
+  r = await api('POST', '/api/clients/prune', { olderThanDays: 0 });   // every offline client
+  assert.deepEqual(r.body.removed.map((c) => c.id), ['fresh-1']);
+  assert.deepEqual((await api('GET', '/api/tree')).body.clients.map((c) => c.id), ['live-1']);
+});

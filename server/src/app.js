@@ -93,6 +93,18 @@ function createApp({
     allTabs: db.prepare('SELECT * FROM tabs ORDER BY client_id, window_id, idx'),
     getTab: db.prepare('SELECT * FROM tabs WHERE client_id = ? AND tab_id = ?'),
     deleteClient: db.prepare('DELETE FROM clients WHERE id = ?'),
+    countClientData: db.prepare(`SELECT
+      (SELECT count(*) FROM windows WHERE client_id = @id) AS windows,
+      (SELECT count(*) FROM tabs WHERE client_id = @id) AS tabs,
+      (SELECT count(*) FROM commands WHERE client_id = @id) AS commands`),
+    // Other clients' commands waiting on one of this client's commands can never be released now.
+    cancelForeignDependents: db.prepare(`UPDATE commands SET status = 'cancelled', acked_at = @now,
+        result = '"dependency removed with its client"'
+      WHERE client_id <> @id AND status IN ('pending','delivered')
+        AND depends_on IN (SELECT id FROM commands WHERE client_id = @id)`),
+    detachForeignDependents: db.prepare(`UPDATE commands SET depends_on = NULL
+      WHERE client_id <> @id AND depends_on IN (SELECT id FROM commands WHERE client_id = @id)`),
+    staleClients: db.prepare('SELECT id FROM clients WHERE last_seen < ?'),
     insCommand: db.prepare(`INSERT INTO commands (client_id, type, payload, depends_on, dep_mode, created_at)
       VALUES (?, ?, ?, ?, ?, ?)`),
     getCommand: db.prepare('SELECT * FROM commands WHERE id = ?'),
@@ -452,10 +464,29 @@ function createApp({
     res.json({ now: now(), onlineMs: ONLINE_MS, clients });
   });
 
+  // Remove a client with its windows, tabs and commands. Archive items and offline copies are kept
+  // (they carry their own copy of the source machine/profile).
+  function removeClient(id) {
+    const counts = st.countClientData.get({ id });
+    const cancelled = st.cancelForeignDependents.run({ id, now: now() }).changes;
+    st.detachForeignDependents.run({ id });   // otherwise the commands FK blocks the cascade
+    st.deleteClient.run(id);
+    return { ...counts, cancelledDependents: cancelled };
+  }
+
   app.delete('/api/clients/:id', (req, res) => {
     requireClient(req.params.id);
-    st.deleteClient.run(req.params.id);
-    res.json({ ok: true });
+    const removed = db.transaction(() => removeClient(req.params.id))();
+    res.json({ ok: true, removed });
+  });
+
+  // Remove every offline client not seen for `olderThanDays` days (0 = every offline client).
+  app.post('/api/clients/prune', (req, res) => {
+    const days = Number((req.body || {}).olderThanDays);
+    if (!Number.isFinite(days) || days < 0) throw httpError(400, 'olderThanDays must be a number >= 0');
+    const cutoff = Math.min(now() - days * 86_400_000, now() - ONLINE_MS);
+    const removed = db.transaction(() => st.staleClients.all(cutoff).map((c) => ({ id: c.id, ...removeClient(c.id) })))();
+    res.json({ ok: true, removed });
   });
 
   // Generic command: {clientId, type:'open', urls|tabs:[...], newWindow} | {clientId, type:'close', tabIds:[...]}

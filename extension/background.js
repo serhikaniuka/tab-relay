@@ -26,12 +26,24 @@ async function getConfig() {
   };
 }
 
-async function getClientId() {
-  const { clientId } = await chrome.storage.local.get('clientId');
-  if (clientId) return clientId;
-  const id = crypto.randomUUID();
-  await chrome.storage.local.set({ clientId: id });
-  return id;
+// One shared promise per service-worker instance: concurrent callers (poll loop, debounced push,
+// options "sync now") all get the same id. Without it, two callers on first run could both see
+// "no id yet" and each generate one, creating duplicate clients on the server.
+let clientIdPromise = null;
+function getClientId() {
+  if (!clientIdPromise) {
+    clientIdPromise = (async () => {
+      const { clientId } = await chrome.storage.local.get('clientId');
+      if (clientId) return clientId;
+      const id = crypto.randomUUID();
+      await chrome.storage.local.set({ clientId: id });
+      return id;
+    })().catch((e) => {
+      clientIdPromise = null;   // let the next call retry
+      throw e;
+    });
+  }
+  return clientIdPromise;
 }
 
 async function getProfile(cfg) {
@@ -335,6 +347,7 @@ async function pollCommands() {
 // ---------- main loop ----------
 
 let loopTimer = null;
+let loopStarted = false;
 async function tick() {
   clearTimeout(loopTimer);
   try {
@@ -345,7 +358,11 @@ async function tick() {
   }
 }
 function ensureLoop() {
-  if (!loopTimer) tick();
+  // Set synchronously: loopTimer is only assigned after the first tick's awaits, so checking it
+  // would let onInstalled/onStartup/alarm/top-level calls start several loops at once.
+  if (loopStarted) return;
+  loopStarted = true;
+  tick();
 }
 
 async function setup() {

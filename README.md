@@ -125,7 +125,11 @@ Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localS
 - Chrome won't display MHTML loaded over http(s); it always downloads it. So the server unpacks the archive: the reader view serves the saved HTML, and its images, CSS and frames come from the same copy. Scripts are disabled (`CSP: sandbox; script-src 'none'`). The downloaded `.mhtml` opens in Chrome as a file.
 
 **Other**
-- A green dot means the client was in contact within the last 30 s. Offline clients can be removed with **forget**.
+- A green dot means the client was in contact within the last 30 s.
+- Offline clients have a **Remove** button, e.g. for a stale duplicate of a profile. It asks for confirmation, then deletes the client with its windows, tabs and commands.
+  - Its archived tabs and offline copies are kept.
+  - Other clients' commands that were waiting on it (e.g. the close half of a move) are cancelled.
+  - **Remove offline clients…** in the toolbar does the same for every offline client not seen for N days.
 - **Recent commands** shows the queue status: pending, delivered, done, failed, or cancelled.
 
 ## How it works
@@ -159,7 +163,8 @@ Open `http://192.168.1.103:8787/` and enter the token (it's remembered in localS
 | `POST /api/commands` | raw command `{clientId, type:'open', urls, newWindow}` or `{clientId, type:'close', tabIds}` |
 | `GET /api/commands` | recent commands and their status |
 | `GET/POST /api/snapshots`, `POST /api/snapshots/:id/restore`, `DELETE /api/snapshots/:id` | snapshots |
-| `DELETE /api/clients/:id` | forget a client |
+| `DELETE /api/clients/:id` | remove a client (windows, tabs, commands; archive and offline copies are kept) |
+| `POST /api/clients/prune` | `{olderThanDays}` → remove offline clients not seen for that long (0 = all offline) |
 
 ## Українською
 
